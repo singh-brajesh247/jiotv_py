@@ -1,0 +1,4 @@
+interface:
+  display_name: "jio_py Dev"
+  short_description: "Develop and debug the JIO_tv Python app"
+  default_prompt: "Use $jio-py-dev to work on the jio_py JIO_tv app efficiently."
