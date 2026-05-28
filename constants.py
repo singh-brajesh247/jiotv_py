@@ -38,12 +38,12 @@ REFRESH_SSO_TOKEN_URL = (
     "https://tv.media.jio.com/apis/v2.0/loginotp/refresh?langId=6"
 )
 CHANNELS_API_URL = (
-    "https://jiotvapi.cdn.jio.com/apis/v3.0/getMobileChannelList/get/"
-    "?langId=6&os=android&devicetype=phone&usertype=JIO&version=315&langId=6"
+    "https://jiotvapi.cdn.jio.com/apis/v3.1/getMobileChannelList/get/"
+    "?langId=6&os=android&devicetype=phone&usertype=JIO&version=406"
 )
 CHANNEL_URL = (
-    "https://jiotv.data.cdn.jio.com/apis/v3.0/getMobileChannelList/get/"
-    "?os=android&devicetype=phone&usertype=tvYR7NSNn7rymo3F"
+    "https://jiotv.data.cdn.jio.com/apis/v3.1/getMobileChannelList/get/"
+    "?langId=6&os=android&devicetype=phone&usertype=tvYR7NSNn7rymo3F&version=406"
 )
 EPG_URL = "https://jiotv.data.cdn.jio.com/apis/v1.3/getepg/get/?offset=%d&channel_id=%d"
 EPG_POSTER_URL = "https://jiotv.catchup.cdn.jio.com/dare_images/shows"
@@ -56,7 +56,7 @@ ACCEPT_ENCODING = "Accept-Encoding"
 USER_AGENT = "User-Agent"
 AUTHORIZATION = "Authorization"
 HOST = "Host"
-ACCESS_TOKEN = "accessToken"
+ACCESS_TOKEN = "accesstoken"
 DEVICE_TYPE = "devicetype"
 VERSION_CODE = "versionCode"
 OS = "os"
@@ -72,6 +72,7 @@ DEVICE_TYPE_PHONE = "phone"
 OS_ANDROID = "android"
 VERSION_CODE_315 = "315"
 VERSION_CODE_389 = "389"
+VERSION_CODE_406 = "406"
 API_KEY_JIO = "l7xx75e822925f184370b2e25170c5d5820a"
 
 EPG_TASK_ID = "epg-generation"
@@ -128,6 +129,9 @@ SONY_LIST = {
     "524",
     "525",
     "697",
+    "762",
+    "823",
+    "852",
     "872",
     "873",
     "874",
@@ -135,6 +139,7 @@ SONY_LIST = {
     "892",
     "1146",
     "1393",
+    "1396",
     "1772",
     "1773",
     "1774",
@@ -211,3 +216,36 @@ SONY_JIO_MAP = {
     "sl155": "sonyten5hd",
     "sl852": "sonybbcearthhd",
 }
+
+# Matches the Android player's specialIds list. These streams start more
+# reliably after the first few live-window seconds are skipped.
+SMOOTH_START_CHANNELS = {
+    "154",
+    "155",
+    "162",
+    "204",
+    "289",
+    "291",
+    "471",
+    "474",
+    "476",
+    "483",
+    "514",
+    "524",
+    "525",
+    "697",
+    "872",
+    "873",
+    "874",
+    "891",
+    "892",
+    "1146",
+    "1393",
+    "1396",
+    "1772",
+    "1773",
+    "1774",
+    "1775",
+    "3351",
+}
+SMOOTH_START_OFFSET_SECONDS = 14.5

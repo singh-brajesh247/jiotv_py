@@ -305,7 +305,7 @@ def refresh_access_token() -> None:
     }
     headers = {
         constants.DEVICE_TYPE: constants.DEVICE_TYPE_PHONE,
-        constants.VERSION_CODE: constants.VERSION_CODE_389,
+        constants.VERSION_CODE: constants.VERSION_CODE_406,
         constants.OS: constants.OS_ANDROID,
         constants.CONTENT_TYPE: constants.CONTENT_TYPE_JSON_UTF8,
         constants.HOST: constants.AUTH_MEDIA_DOMAIN,
@@ -332,7 +332,7 @@ def refresh_sso_token() -> None:
     device_id = get_device_id()
     headers = {
         constants.DEVICE_TYPE: constants.DEVICE_TYPE_PHONE,
-        constants.VERSION_CODE: constants.VERSION_CODE_389,
+        constants.VERSION_CODE: constants.VERSION_CODE_406,
         constants.OS: constants.OS_ANDROID,
         constants.HOST: constants.TV_MEDIA_DOMAIN,
         constants.USER_AGENT: constants.USER_AGENT_OKHTTP,

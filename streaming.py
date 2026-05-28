@@ -49,6 +49,11 @@ def absolute_base_from_live_result(live_result: LiveURLOutput | None) -> str:
     if live_result is None:
         return ""
     candidates = [
+        live_result.ssai.playback_url,
+        live_result.ssai.bitrates.auto,
+        live_result.ssai.bitrates.high,
+        live_result.ssai.bitrates.medium,
+        live_result.ssai.bitrates.low,
         live_result.bitrates.auto,
         live_result.bitrates.high,
         live_result.bitrates.medium,
@@ -129,6 +134,11 @@ def extract_live_result_hdnea(live_result: LiveURLOutput | None) -> str:
     if live_result is None:
         return ""
     candidates = [
+        live_result.ssai.playback_url,
+        live_result.ssai.bitrates.auto,
+        live_result.ssai.bitrates.high,
+        live_result.ssai.bitrates.medium,
+        live_result.ssai.bitrates.low,
         live_result.bitrates.auto,
         live_result.bitrates.high,
         live_result.bitrates.medium,
@@ -178,9 +188,18 @@ def clear_cached_hdnea(channel_id: str) -> None:
         _hdnea_cache.pop(channel_id, None)
 
 
-def select_best_live_hls_url(live_result: LiveURLOutput | None, quality: str) -> str:
+def select_best_live_hls_url(
+    live_result: LiveURLOutput | None,
+    quality: str,
+    *,
+    prefer_ssai: bool = False,
+) -> str:
     if live_result is None:
         return ""
+    if prefer_ssai:
+        ssai_selected = select_best_live_ssai_url(live_result, quality)
+        if ssai_selected:
+            return ssai_selected
     selected = select_quality(
         quality,
         live_result.bitrates.auto,
@@ -205,12 +224,49 @@ def select_best_live_hls_url(live_result: LiveURLOutput | None, quality: str) ->
     return ""
 
 
-def live_hls_url_candidates(live_result: LiveURLOutput | None, quality: str) -> list[str]:
+def select_best_live_ssai_url(live_result: LiveURLOutput | None, quality: str) -> str:
+    if live_result is None:
+        return ""
+    selected = select_quality(
+        quality,
+        live_result.ssai.bitrates.auto,
+        live_result.ssai.bitrates.high,
+        live_result.ssai.bitrates.medium,
+        live_result.ssai.bitrates.low,
+    )
+    if selected:
+        return selected
+    for candidate in (
+        live_result.ssai.bitrates.high,
+        live_result.ssai.bitrates.auto,
+        live_result.ssai.bitrates.medium,
+        live_result.ssai.bitrates.low,
+    ):
+        if candidate:
+            return candidate
+    return live_result.ssai.playback_url
+
+
+def live_hls_url_candidates(
+    live_result: LiveURLOutput | None,
+    quality: str,
+    *,
+    prefer_ssai: bool = False,
+) -> list[str]:
     if live_result is None:
         return []
-    preferred = select_best_live_hls_url(live_result, quality)
+    preferred = select_best_live_hls_url(
+        live_result,
+        quality,
+        prefer_ssai=prefer_ssai,
+    )
     candidates = [
         preferred,
+        live_result.ssai.playback_url,
+        live_result.ssai.bitrates.auto,
+        live_result.ssai.bitrates.high,
+        live_result.ssai.bitrates.medium,
+        live_result.ssai.bitrates.low,
         live_result.bitrates.auto,
         live_result.bitrates.high,
         live_result.bitrates.medium,
@@ -250,8 +306,22 @@ def select_best_live_mpd_url(live_result: LiveURLOutput | None, quality: str) ->
     return live_result.mpd.result
 
 
-MEDIA_PATTERN = re.compile(r"[a-z0-9=_\-A-Z/.\:]*\.(m3u8|ts|aac)(\?[^\s\"']*)?")
-KEY_PATTERN = re.compile(r"http[\S]+\.(pkey|key)")
+MEDIA_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?:https?://|//|/|\.\./|[A-Za-z0-9])"
+    r"[A-Za-z0-9=_\-./:%+~@]*"
+    r"\.(?:m3u8|ts|aac|m4s|mp4|m4a|cmfv|cmfa|vtt|webvtt)"
+    r"(?:\?[^\s\"']*)?",
+    re.IGNORECASE,
+)
+KEY_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?:https?://|//|/|\.\./|[A-Za-z0-9])"
+    r"[A-Za-z0-9=_\-./:%+~@]*"
+    r"\.(?:pkey|key)"
+    r"(?:\?[^\s\"']*)?",
+    re.IGNORECASE,
+)
 
 
 def base_and_params(render_url: str, hdnea_token: str) -> tuple[str, str]:

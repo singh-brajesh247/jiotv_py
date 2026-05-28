@@ -5,10 +5,12 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urlencode, urlparse
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 
 from . import constants
 from .config import cfg, parse_simple_yaml
@@ -68,7 +70,7 @@ class Television:
             "uniqueId": credentials.unique_id,
             constants.USER_AGENT: constants.USER_AGENT_OKHTTP,
             "usergroup": "tvYR7NSNn7rymo3F",
-            "versionCode": constants.VERSION_CODE_389,
+            "versionCode": constants.VERSION_CODE_406,
         }
 
     def live(self, channel_id: str) -> LiveURLOutput:
@@ -100,36 +102,63 @@ class Television:
                 f"live request failed with status {resp.status}: {resp.body!r}"
             )
         result = LiveURLOutput.from_api(resp.json())
-        hdnea = _extract_hdnea_from_url(result.bitrates.auto) or _extract_hdnea_from_url(
-            result.mpd.result
+        hdnea = (
+            _extract_hdnea_from_url(result.bitrates.auto)
+            or _extract_hdnea_from_url(result.ssai.bitrates.auto)
+            or _extract_hdnea_from_url(result.ssai.playback_url)
+            or _extract_hdnea_from_url(result.mpd.result)
         )
         result.hdnea = hdnea
         if hdnea:
             _append_hdnea(result, hdnea)
         log.info(
-            "live api ok channel=%s code=%s drm=%s hls_auto=%s mpd=%s hdnea=%s",
+            "live api ok channel=%s code=%s drm=%s bitrates=%s mpd=%s hdnea=%s",
             channel_id,
             result.code,
             result.is_drm,
-            bool(result.bitrates.auto),
+            _bitrate_summary(result),
             bool(result.mpd.result or result.mpd.bitrates.auto),
             token_preview(hdnea),
         )
         return result
 
-    def render(self, stream_url: str, hdnea_token: str = "") -> tuple[bytes, int, str]:
+    def render(
+        self,
+        stream_url: str,
+        hdnea_token: str = "",
+        *,
+        ssai_session: bool = False,
+    ) -> tuple[bytes, int, str]:
         headers = dict(self.headers)
         headers[constants.USER_AGENT] = constants.USER_AGENT_PLAY_TV
         token = hdnea_token or _extract_hdnea_from_url(stream_url)
         if token:
             headers["Cookie"] = f"__hdnea__={token}"
-        resp = request(stream_url, headers=headers)
+        request_url = (
+            _with_ssai_session_params(stream_url) if ssai_session else stream_url
+        )
+        resp = request(request_url, headers=headers)
+        render_log_url = request_url
         new_hdnea = _extract_cookie(resp.headers.get_all("Set-Cookie", []))
+        ssai_media_url = _extract_ssai_media_url(resp.body)
+        if resp.status < 400 and ssai_media_url:
+            log.info(
+                "render ssai session resolved url=%s media=%s",
+                redact_url(request_url),
+                redact_url(ssai_media_url),
+            )
+            media_token = hdnea_token or _extract_hdnea_from_url(ssai_media_url)
+            if media_token:
+                headers["Cookie"] = f"__hdnea__={media_token}"
+            resp = request(ssai_media_url, headers=headers)
+            render_log_url = ssai_media_url
+            media_hdnea = _extract_cookie(resp.headers.get_all("Set-Cookie", []))
+            new_hdnea = media_hdnea or new_hdnea
         log.info(
             "render upstream status=%s bytes=%s url=%s cookie_in=%s cookie_out=%s",
             resp.status,
             len(resp.body),
-            redact_url(stream_url),
+            redact_url(render_log_url),
             token_preview(token),
             token_preview(new_hdnea),
         )
@@ -174,6 +203,8 @@ class Television:
         result.hdnea = (
             _extract_hdnea_from_url(result.result)
             or _extract_hdnea_from_url(result.bitrates.auto)
+            or _extract_hdnea_from_url(result.ssai.bitrates.auto)
+            or _extract_hdnea_from_url(result.ssai.playback_url)
         )
         log.info(
             "catchup api ok channel=%s drm=%s target=%s hdnea=%s",
@@ -438,13 +469,93 @@ def _append_hdnea(result: LiveURLOutput, hdnea: str) -> None:
             return url
         return f"{url}{'&' if '?' in url else '?'}hdnea={hdnea}"
 
+    def append_media_url(url: str) -> str:
+        lower_url = url.lower()
+        if ".m3u8" not in lower_url and ".mpd" not in lower_url:
+            return url
+        return append(url)
+
     result.bitrates.auto = append(result.bitrates.auto)
     result.bitrates.high = append(result.bitrates.high)
     result.bitrates.medium = append(result.bitrates.medium)
     result.bitrates.low = append(result.bitrates.low)
     result.result = append(result.result)
+    result.ssai.playback_url = append_media_url(result.ssai.playback_url)
+    result.ssai.bitrates.auto = append_media_url(result.ssai.bitrates.auto)
+    result.ssai.bitrates.high = append_media_url(result.ssai.bitrates.high)
+    result.ssai.bitrates.medium = append_media_url(result.ssai.bitrates.medium)
+    result.ssai.bitrates.low = append_media_url(result.ssai.bitrates.low)
     result.mpd.result = append(result.mpd.result)
     result.mpd.key = append(result.mpd.key)
+
+
+def _with_ssai_session_params(stream_url: str) -> str:
+    if not stream_url:
+        return stream_url
+    parsed = urlparse(stream_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return stream_url
+    lower_path = parsed.path.lower()
+    if ".m3u8" in lower_path or ".mpd" in lower_path:
+        return stream_url
+
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    existing = {key for key, _value in pairs}
+    hour = datetime.now().hour
+    minute = datetime.now().minute
+    defaults = {
+        "cgi": "defaultCGI",
+        "dt": "1",
+        "md_dvb": "Jio",
+        "md_dvm": "Android",
+        "md_hr": str(hour),
+        "md_min": str(minute),
+        "md_osv": "13",
+        "os": "1",
+        "sh": "1920",
+        "sw": "1080",
+        "trq": str(int(time.time() * 1000)),
+        "vr": "AN-2.4.15",
+    }
+    changed = False
+    for key, value in defaults.items():
+        if key in existing:
+            continue
+        pairs.append((key, value))
+        changed = True
+    if not changed:
+        return stream_url
+    return urlunparse(parsed._replace(query=urlencode(pairs)))
+
+
+def _bitrate_summary(result: LiveURLOutput) -> str:
+    def available(label: str, bitrates: Bitrates) -> str:
+        names = [
+            name
+            for name, value in (
+                ("auto", bitrates.auto),
+                ("high", bitrates.high),
+                ("medium", bitrates.medium),
+                ("low", bitrates.low),
+            )
+            if value
+        ]
+        return f"{label}=[{','.join(names) or 'none'}]"
+
+    parts = [available("hls", result.bitrates)]
+    if result.ssai.playback_url or any(
+        (
+            result.ssai.bitrates.auto,
+            result.ssai.bitrates.high,
+            result.ssai.bitrates.medium,
+            result.ssai.bitrates.low,
+        )
+    ):
+        parts.append(available("ssai", result.ssai.bitrates))
+        if result.ssai.playback_url:
+            parts.append("ssai_playback=1")
+    parts.append(available("mpd", result.mpd.bitrates))
+    return " ".join(parts)
 
 
 def _extract_cookie(set_cookie_headers: list[str]) -> str:
@@ -454,6 +565,18 @@ def _extract_cookie(set_cookie_headers: list[str]) -> str:
             if trimmed.startswith("__hdnea__="):
                 return trimmed.removeprefix("__hdnea__=")
     return ""
+
+
+def _extract_ssai_media_url(body: bytes) -> str:
+    preview = body.lstrip()[:1]
+    if preview != b"{":
+        return ""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    media_url = data.get("mediaURL", data.get("mediaUrl", data.get("media_url", "")))
+    return str(media_url or "")
 
 
 BUILT_IN_CUSTOM_CHANNELS_JSON = """{

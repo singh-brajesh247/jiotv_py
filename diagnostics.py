@@ -12,6 +12,7 @@ log = logging.getLogger("JIO_tv")
 SENSITIVE_QUERY_KEYS = {
     "__hdnea__",
     "access_token",
+    "accesstoken",
     "accessToken",
     "auth",
     "authToken",
@@ -23,7 +24,7 @@ SENSITIVE_QUERY_KEYS = {
 }
 
 SENSITIVE_JSON_RE = re.compile(
-    r'("(?:accessToken|authToken|refreshToken|ssoToken|ssotoken)"\s*:\s*")([^"]+)(")',
+    r'("(?:accesstoken|accessToken|authToken|refreshToken|ssoToken|ssotoken)"\s*:\s*")([^"]+)(")',
     re.IGNORECASE,
 )
 

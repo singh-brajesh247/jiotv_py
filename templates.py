@@ -431,10 +431,19 @@ document.addEventListener("DOMContentLoaded", function () {{
     return page(title, body, scripts=scripts)
 
 
-def render_hls_player(play_url: str, is_catchup: bool = False) -> str:
+def render_hls_player(
+    play_url: str,
+    is_catchup: bool = False,
+    channel_id: str = "",
+) -> str:
     live = "false" if is_catchup else "true"
     seekable = "true" if is_catchup else "false"
     retry = "false" if is_catchup else "true"
+    smooth_start_seconds = (
+        constants.SMOOTH_START_OFFSET_SECONDS
+        if not is_catchup and channel_id in constants.SMOOTH_START_CHANNELS
+        else 0
+    )
     preload = (
         f'<link rel="preload" href="{escape(play_url)}" as="fetch" crossorigin="anonymous" />'
         if not is_catchup and play_url.startswith("/live/")
@@ -472,6 +481,49 @@ def render_hls_player(play_url: str, is_catchup: bool = False) -> str:
     }},
     ui: flowplayer.ui.USE_THIN_CONTROLBAR,
   }});
+
+  const smoothStartSeconds = {smooth_start_seconds};
+  if (smoothStartSeconds > 0) {{
+    const attachSmoothStart = () => {{
+      const video = document.querySelector("#JIO_tv_player video");
+      if (!video) return false;
+      let applied = false;
+      const seek = () => {{
+        if (applied) return;
+        try {{
+          let target = smoothStartSeconds;
+          if (video.seekable && video.seekable.length > 0) {{
+            const start = video.seekable.start(0);
+            const end = video.seekable.end(video.seekable.length - 1);
+            target = Math.min(start + smoothStartSeconds, Math.max(start, end - 2));
+          }}
+          if (Number.isFinite(target) && video.currentTime < target) {{
+            video.currentTime = target;
+          }}
+          applied = true;
+        }} catch (error) {{}}
+      }};
+      video.addEventListener("loadedmetadata", seek, {{ once: true }});
+      video.addEventListener("canplay", seek, {{ once: true }});
+      video.addEventListener("playing", seek, {{ once: true }});
+      video.addEventListener("ended", () => {{
+        applied = false;
+        seek();
+        video.play().catch(() => {{}});
+      }});
+      seek();
+      return true;
+    }};
+    if (!attachSmoothStart()) {{
+      const observer = new MutationObserver(() => {{
+        if (attachSmoothStart()) observer.disconnect();
+      }});
+      observer.observe(document.getElementById("JIO_tv_player"), {{
+        childList: true,
+        subtree: true
+      }});
+    }}
+  }}
 </script>"""
     head = f"""
 <style>body{{margin:0;padding:0;background-color:#000;overflow-y:hidden}}</style>

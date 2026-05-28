@@ -27,7 +27,7 @@ from .constants import (
     JIOTV_API_DOMAIN,
     OS,
     OS_ANDROID,
-    VERSION_CODE_389,
+    VERSION_CODE_406,
 )
 from .diagnostics import body_preview, log, redact_url, token_preview
 from .http_client import json_request, request
@@ -142,7 +142,7 @@ def perform_server_logout() -> None:
     headers = {
         ACCEPT_ENCODING: ACCEPT_ENCODING_GZIP,
         DEVICE_TYPE: DEVICE_TYPE_PHONE,
-        "versioncode": VERSION_CODE_389,
+        "versioncode": VERSION_CODE_406,
         OS: OS_ANDROID,
         CONTENT_TYPE: CONTENT_TYPE_JSON_UTF8,
     }

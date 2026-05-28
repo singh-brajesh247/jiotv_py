@@ -537,7 +537,12 @@ class JioTVRequestHandler:
         live_result = self._get_live_result(channel_id)
         if channel_id in {"1349", "1322"}:
             quality = "auto"
-        live_url = select_best_live_hls_url(live_result, quality)
+        prefer_ssai = channel_id in constants.SONY_LIST
+        live_url = select_best_live_hls_url(
+            live_result,
+            quality,
+            prefer_ssai=prefer_ssai,
+        )
         if not live_url:
             log.warning(
                 "live route no hls url channel=%s quality=%s api_message=%s",
@@ -551,9 +556,10 @@ class JioTVRequestHandler:
         if live_result.hdnea:
             set_cached_hdnea(channel_id, live_result.hdnea)
         log.info(
-            "live route selected channel=%s quality=%s url=%s hdnea=%s",
+            "live route selected channel=%s quality=%s ssai=%s url=%s hdnea=%s",
             channel_id,
             quality,
+            prefer_ssai,
             redact_url(live_url),
             token_preview(live_result.hdnea),
         )
@@ -612,7 +618,12 @@ class JioTVRequestHandler:
         )
 
         assert state.tv is not None
-        body, status, new_hdnea = state.tv.render(render_url, cached_hdnea)
+        is_sony_channel = channel_id in constants.SONY_LIST
+        body, status, new_hdnea = state.tv.render(
+            render_url,
+            cached_hdnea,
+            ssai_session=is_sony_channel,
+        )
         if new_hdnea:
             set_cached_hdnea(channel_id, new_hdnea)
             cached_hdnea = new_hdnea
@@ -634,6 +645,7 @@ class JioTVRequestHandler:
                 body, status, new_hdnea = state.tv.render(
                     strip_hdnea_from_url(decoded_url),
                     cached_hdnea,
+                    ssai_session=is_sony_channel,
                 )
                 log.info(
                     "render m3u8 retry original channel=%s status=%s token=%s",
@@ -643,7 +655,11 @@ class JioTVRequestHandler:
                 )
                 if status == 404:
                     current_url = strip_hdnea_from_url(decoded_url)
-                    for candidate in live_hls_url_candidates(refreshed, quality or "auto"):
+                    for candidate in live_hls_url_candidates(
+                        refreshed,
+                        quality or "auto",
+                        prefer_ssai=is_sony_channel,
+                    ):
                         candidate_url = to_absolute_stream_url(candidate, refreshed)
                         candidate_token = extract_hdnea_from_url(candidate_url)
                         candidate_render_url = (
@@ -661,6 +677,7 @@ class JioTVRequestHandler:
                         body, status, new_hdnea = state.tv.render(
                             candidate_render_url,
                             cached_hdnea or candidate_token,
+                            ssai_session=is_sony_channel,
                         )
                         if new_hdnea:
                             set_cached_hdnea(channel_id, new_hdnea)
@@ -711,10 +728,10 @@ class JioTVRequestHandler:
             target = match.group(0)
             target_path, _, target_params = target.partition("?")
             merged_params = _merge_params(target_params, params)
-            endpoint = "/render.m3u8" if target_path.endswith(".m3u8") else "/render.ts"
+            endpoint = "/render.m3u8" if target_path.lower().endswith(".m3u8") else "/render.ts"
             encrypted = television.create_encrypted_url(
                 television.EncryptedURLConfig(
-                    base_url="" if target_path.startswith("http") else base_url,
+                    base_url=_manifest_reference_base_url(base_url, target_path),
                     match=target_path,
                     params=merged_params,
                     channel_id=channel_id,
@@ -729,14 +746,26 @@ class JioTVRequestHandler:
         def key_replacer(match: re.Match[str]) -> str:
             nonlocal key_count
             key_count += 1
-            return television.replace_key(match.group(0), params, channel_id)
+            target = match.group(0)
+            target_path, _, target_params = target.partition("?")
+            return television.create_encrypted_url(
+                television.EncryptedURLConfig(
+                    base_url=_manifest_reference_base_url(base_url, target_path),
+                    match=target_path,
+                    params=_merge_params(target_params, params),
+                    channel_id=channel_id,
+                    endpoint_url="/render.key",
+                )
+            )
 
+        manifest, removed_variants = _filter_broken_sony_variants(manifest, channel_id)
         rewritten = KEY_PATTERN.sub(key_replacer, MEDIA_PATTERN.sub(media_replacer, manifest))
         log.info(
-            "manifest rewrite channel=%s media_refs=%s key_refs=%s base=%s",
+            "manifest rewrite channel=%s media_refs=%s key_refs=%s removed_variants=%s base=%s",
             channel_id,
             media_count,
             key_count,
+            removed_variants,
             redact_url(base_url),
         )
         return rewritten
@@ -946,7 +975,7 @@ class JioTVRequestHandler:
         self._start_live_warmup(channel_id, quality or "auto", "hls")
         play_url = build_hls_play_url(quality, channel_id)
         log.info("hls player channel=%s play_url=%s", channel_id, play_url)
-        self._send_html(templates.render_hls_player(play_url))
+        self._send_html(templates.render_hls_player(play_url, channel_id=channel_id))
 
     def _catchup_routes(self, path: str, query: dict[str, list[str]]) -> None:
         if path.startswith("/catchup/play/"):
@@ -1087,7 +1116,12 @@ class JioTVRequestHandler:
             return
         if self._is_custom_channel(channel_id):
             channel, _ = television.get_custom_channel_by_id(channel_id)
-            self._send_html(templates.render_hls_player(channel.url if channel else ""))
+            self._send_html(
+                templates.render_hls_player(
+                    channel.url if channel else "",
+                    channel_id=channel_id,
+                )
+            )
             return
         self._ensure_tokens()
         try:
@@ -1097,7 +1131,12 @@ class JioTVRequestHandler:
             drm_output = {}
         if not drm_output.get("play_url"):
             log.warning("mpd page fallback to hls channel=%s quality=%s", channel_id, quality)
-            self._send_html(templates.render_hls_player(build_hls_play_url(quality, channel_id)))
+            self._send_html(
+                templates.render_hls_player(
+                    build_hls_play_url(quality, channel_id),
+                    channel_id=channel_id,
+                )
+            )
             return
         log.info(
             "mpd page drm output channel=%s play_url=%s license=%s",
@@ -1191,7 +1230,7 @@ class JioTVRequestHandler:
             "crmid": state.tv.crm,
             "channelid": channel_id,
             "uniqueId": state.tv.unique_id,
-            "versionCode": constants.VERSION_CODE_389,
+            "versionCode": constants.VERSION_CODE_406,
             "usergroup": "tvYR7NSNn7rymo3F",
             "devicetype": "phone",
             "Accept-Encoding": "gzip, deflate",
@@ -1359,7 +1398,7 @@ class JioTVRequestHandler:
         return (
             state.enable_drm
             and not self._is_custom_channel(channel_id)
-            and (player_mode in {"auto", "hd"} or channel_id in constants.SONY_LIST)
+            and (player_mode == "hd" or channel_id in constants.SONY_LIST)
         )
 
     def _cached_live_result(self, channel_id: str) -> LiveURLOutput | None:
@@ -1697,6 +1736,14 @@ def _proxy_passthrough_headers(
     return forwarded
 
 
+def _manifest_reference_base_url(base_url: str, target_path: str) -> str:
+    if target_path.startswith("//"):
+        return "https:"
+    if urlparse(target_path).scheme in {"http", "https"}:
+        return ""
+    return base_url
+
+
 def _dash_base_url(proxy_host: str, proxy_path: str, hdnea_token: str = "") -> str:
     encrypted_host = secure_url.encrypt_url(proxy_host)
     encrypted_path = secure_url.encrypt_url(proxy_path)
@@ -1797,6 +1844,48 @@ def _merge_params(first: str, second: str) -> str:
         for item in items:
             flattened.append((key, item))
     return urlencode(flattened)
+
+
+DEAD_SONY_LOW_VARIANT_PATTERN = re.compile(
+    r"(?:^|/)[^/\s\"']*sony[^/\s\"']*_250\.m3u8(?:\?|$)",
+    re.IGNORECASE,
+)
+
+
+def _filter_broken_sony_variants(manifest: str, channel_id: str) -> tuple[str, int]:
+    if channel_id not in constants.SONY_LIST:
+        return manifest, 0
+    lines = manifest.splitlines(keepends=True)
+    output: list[str] = []
+    pending_stream_inf: list[str] = []
+    removed = 0
+
+    for line in lines:
+        stripped = line.strip()
+        if pending_stream_inf:
+            if _is_dead_sony_low_variant(stripped):
+                pending_stream_inf = []
+                removed += 1
+                continue
+            output.extend(pending_stream_inf)
+            pending_stream_inf = []
+            output.append(line)
+            continue
+
+        if stripped.startswith("#EXT-X-STREAM-INF"):
+            pending_stream_inf = [line]
+            continue
+        if _is_dead_sony_low_variant(stripped):
+            removed += 1
+            continue
+        output.append(line)
+
+    output.extend(pending_stream_inf)
+    return "".join(output), removed
+
+
+def _is_dead_sony_low_variant(value: str) -> bool:
+    return bool(DEAD_SONY_LOW_VARIANT_PATTERN.search(value))
 
 
 def _format_catchup_times(start: str, end: str) -> tuple[str, str]:

@@ -6,16 +6,20 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from email.message import Message
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from jio_py import constants, secure_url, templates
 from jio_py.config import JioTVConfig, parse_simple_yaml
-from jio_py.models import Bitrates, LiveURLOutput
+from jio_py.diagnostics import body_preview, redact_url
+from jio_py.models import Bitrates, LiveURLOutput, SSAI
 from jio_py.server import (
     JioTVRequestHandler,
     _asgi_headers,
     _asgi_request_target,
     _cookie_header_from_set_cookie,
     _dash_passthrough_query,
+    _filter_broken_sony_variants,
+    _manifest_reference_base_url,
     _parse_raw_http_response_head,
     _rewrite_mpd_base_url,
     state,
@@ -23,10 +27,19 @@ from jio_py.server import (
 from jio_py.streaming import (
     extract_hdnea_from_url,
     hdnea_remaining_lifetime,
+    live_hls_url_candidates,
+    select_best_live_hls_url,
+    select_best_live_ssai_url,
     strip_hdnea_from_url,
     to_absolute_stream_url,
 )
-from jio_py.television import EncryptedURLConfig, create_encrypted_url, load_custom_channels
+from jio_py.television import (
+    EncryptedURLConfig,
+    _extract_ssai_media_url,
+    _with_ssai_session_params,
+    create_encrypted_url,
+    load_custom_channels,
+)
 from jio_py.tokens import should_refresh_token
 
 
@@ -109,6 +122,25 @@ channels:
         self.assertEqual(channels[0].id, "cc_test_channel")
         self.assertTrue(channels[0].is_hd)
 
+    def test_extract_ssai_media_url(self) -> None:
+        body = b'{"mediaURL":"https://example.com/resolved.m3u8","vastURL":"https://ads"}'
+        self.assertEqual(
+            _extract_ssai_media_url(body),
+            "https://example.com/resolved.m3u8",
+        )
+        self.assertEqual(_extract_ssai_media_url(b"#EXTM3U\n"), "")
+
+    def test_ssai_session_params_match_android_session_request(self) -> None:
+        result = _with_ssai_session_params("https://example.com/session?x=1")
+        self.assertIn("x=1", result)
+        self.assertIn("cgi=defaultCGI", result)
+        self.assertIn("vr=AN-2.4.15", result)
+        self.assertIn("md_dvm=Android", result)
+
+    def test_ssai_session_params_skip_media_manifests(self) -> None:
+        url = "https://example.com/live/playlist.m3u8?x=1"
+        self.assertEqual(_with_ssai_session_params(url), url)
+
 
 class StreamingTests(unittest.TestCase):
     def test_hdnea_helpers(self) -> None:
@@ -127,6 +159,82 @@ class StreamingTests(unittest.TestCase):
             "https://example.com/live.m3u8",
         )
         self.assertTrue(to_absolute_stream_url("path/live.m3u8").startswith("https://"))
+
+    def test_live_url_selection_prefers_normal_hls_by_default(self) -> None:
+        live_result = LiveURLOutput(
+            bitrates=Bitrates(auto="https://example.com/hls.m3u8"),
+            ssai=SSAI(bitrates=Bitrates(auto="https://example.com/ssai-session")),
+        )
+        self.assertEqual(
+            select_best_live_hls_url(live_result, "auto"),
+            "https://example.com/hls.m3u8",
+        )
+
+    def test_live_url_selection_can_prefer_ssai_bitrates(self) -> None:
+        live_result = LiveURLOutput(
+            bitrates=Bitrates(auto="https://example.com/hls.m3u8"),
+            ssai=SSAI(
+                bitrates=Bitrates(
+                    auto="https://example.com/ssai-auto",
+                    high="https://example.com/ssai-high",
+                )
+            ),
+        )
+        self.assertEqual(
+            select_best_live_ssai_url(live_result, "high"),
+            "https://example.com/ssai-high",
+        )
+        self.assertEqual(
+            select_best_live_hls_url(live_result, "high", prefer_ssai=True),
+            "https://example.com/ssai-high",
+        )
+
+    def test_live_candidates_can_order_ssai_first(self) -> None:
+        live_result = LiveURLOutput(
+            bitrates=Bitrates(auto="https://example.com/hls.m3u8"),
+            ssai=SSAI(bitrates=Bitrates(auto="https://example.com/ssai-auto")),
+        )
+        self.assertEqual(
+            live_hls_url_candidates(live_result, "auto", prefer_ssai=True)[:2],
+            ["https://example.com/ssai-auto", "https://example.com/hls.m3u8"],
+        )
+
+    def test_live_url_output_parses_android_ssai_fields(self) -> None:
+        result = LiveURLOutput.from_api(
+            {
+                "code": 200,
+                "algoNumber": 7,
+                "playbackToken": "play-token",
+                "ssai": {
+                    "bitrates": {"auto": "https://example.com/ssai-auto"},
+                    "ssaiPlaybackUrl": "https://example.com/ssai-playback.m3u8",
+                },
+            }
+        )
+        self.assertEqual(result.algo_number, 7)
+        self.assertEqual(result.playback_token, "play-token")
+        self.assertEqual(result.ssai.bitrates.auto, "https://example.com/ssai-auto")
+        self.assertEqual(
+            result.ssai.playback_url,
+            "https://example.com/ssai-playback.m3u8",
+        )
+
+
+class APICompatibilityTests(unittest.TestCase):
+    def test_android_406_channel_listing_api_is_used(self) -> None:
+        self.assertIn("/apis/v3.1/getMobileChannelList/get/", constants.CHANNELS_API_URL)
+        self.assertIn("version=406", constants.CHANNELS_API_URL)
+        self.assertEqual(constants.ACCESS_TOKEN, "accesstoken")
+
+    def test_redaction_handles_lowercase_access_token_header_name(self) -> None:
+        self.assertIn(
+            "accesstoken=secret...",
+            redact_url("https://example.com/path?accesstoken=secret-token-value"),
+        )
+        self.assertIn(
+            '"accesstoken":"<redacted>"',
+            body_preview(b'{"accesstoken":"secret-token-value"}'),
+        )
 
 
 class DashProxyTests(unittest.TestCase):
@@ -173,6 +281,60 @@ class DashProxyTests(unittest.TestCase):
             {"Range": "bytes=100-", "If-Range": "etag-1"},
         )
 
+    def test_manifest_rewrite_handles_fmp4_segments_and_relative_keys(self) -> None:
+        secure_url.init()
+        handler = object.__new__(JioTVRequestHandler)
+        manifest = (
+            "#EXTM3U\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="keys/live.key"\n'
+            '#EXT-X-MAP:URI="init.mp4"\n'
+            "video/seg-1.m4s?range=1\n"
+        )
+        rewritten = handler._rewrite_manifest(
+            manifest,
+            "https://cdn.example.com/live/master.m3u8?foo=bar&hdnea=old",
+            "fresh-token",
+            "143",
+            "auto",
+        )
+        self.assertIn("/render.key?auth=", rewritten)
+        self.assertIn("/render.ts?auth=", rewritten)
+
+        key_url = next(
+            item.removeprefix('URI="').removesuffix('"')
+            for item in rewritten.replace(",", "\n").splitlines()
+            if item.startswith('URI="/render.key')
+        )
+        segment_url = next(line for line in rewritten.splitlines() if line.startswith("/render.ts"))
+        init_url = next(
+            item.split('URI="', 1)[1].removesuffix('"')
+            for item in rewritten.replace(",", "\n").splitlines()
+            if 'URI="/render.ts' in item
+        )
+
+        self.assertEqual(
+            secure_url.decrypt_url(parse_qs(urlparse(key_url).query)["auth"][0]),
+            "https://cdn.example.com/live/keys/live.key?foo=bar&__hdnea__=fresh-token",
+        )
+        self.assertEqual(
+            secure_url.decrypt_url(parse_qs(urlparse(init_url).query)["auth"][0]),
+            "https://cdn.example.com/live/init.mp4?foo=bar&__hdnea__=fresh-token",
+        )
+        self.assertEqual(
+            secure_url.decrypt_url(parse_qs(urlparse(segment_url).query)["auth"][0]),
+            "https://cdn.example.com/live/video/seg-1.m4s?range=1&foo=bar&__hdnea__=fresh-token",
+        )
+
+    def test_manifest_reference_base_handles_protocol_relative_urls(self) -> None:
+        self.assertEqual(
+            _manifest_reference_base_url("https://cdn.example.com/live/", "//media.example.com/a.m4s"),
+            "https:",
+        )
+        self.assertEqual(
+            _manifest_reference_base_url("https://cdn.example.com/live/", "https://media.example.com/a.m4s"),
+            "",
+        )
+
 
 class LiveWarmupTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -204,10 +366,36 @@ class PlaybackRoutingTests(unittest.TestCase):
         self.assertIn("289", constants.SONY_LIST)
         self.assertTrue(handler._should_use_mpd_player("289", "hls"))
 
-    def test_auto_mode_prefers_mpd_when_drm_enabled(self) -> None:
+    def test_current_jio_sony_ids_use_sony_routing(self) -> None:
+        for channel_id in {"154", "289", "762", "823", "852", "1396"}:
+            self.assertIn(channel_id, constants.SONY_LIST)
+
+    def test_broken_sony_250_variant_is_removed_from_master_manifest(self) -> None:
+        manifest = (
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=250000\n"
+            "Sony_Max_SD_250.m3u8\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=500000\n"
+            "Sony_Max_SD_500.m3u8\n"
+        )
+        filtered, removed = _filter_broken_sony_variants(manifest, "289")
+        self.assertEqual(removed, 1)
+        self.assertNotIn("Sony_Max_SD_250.m3u8", filtered)
+        self.assertIn("Sony_Max_SD_500.m3u8", filtered)
+        self.assertEqual(filtered.count("#EXT-X-STREAM-INF"), 1)
+
+    def test_broken_sony_250_filter_does_not_touch_non_sony_channels(self) -> None:
+        manifest = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=250000\nSony_SAB_250.m3u8\n"
+        filtered, removed = _filter_broken_sony_variants(manifest, "173")
+        self.assertEqual(removed, 0)
+        self.assertEqual(filtered, manifest)
+
+    def test_auto_mode_uses_hls_for_regular_channels_and_mpd_for_sony(self) -> None:
         handler = object.__new__(JioTVRequestHandler)
         handler._is_custom_channel = lambda _channel_id: False
-        self.assertTrue(handler._should_use_mpd_player("143", "auto"))
+        self.assertFalse(handler._should_use_mpd_player("143", "auto"))
+        self.assertTrue(handler._should_use_mpd_player("143", "hd"))
+        self.assertTrue(handler._should_use_mpd_player("289", "auto"))
         self.assertFalse(handler._should_use_mpd_player("143", "hls"))
 
 
@@ -258,6 +446,12 @@ class TemplateTests(unittest.TestCase):
         html = templates.render_hls_player("/live/155.m3u8")
         self.assertIn('rel="preload"', html)
         self.assertIn('href="/live/155.m3u8"', html)
+
+    def test_hls_player_applies_smooth_start_to_android_special_channels(self) -> None:
+        html = templates.render_hls_player("/live/155.m3u8", channel_id="155")
+        self.assertIn("const smoothStartSeconds = 14.5", html)
+        normal = templates.render_hls_player("/live/143.m3u8", channel_id="143")
+        self.assertIn("const smoothStartSeconds = 0", normal)
 
     def test_play_iframe_prioritizes_autoplay_media(self) -> None:
         html = templates.render_play("Test", "/player/155?q=auto", "155")

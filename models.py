@@ -113,6 +113,22 @@ class Bitrates:
 
 
 @dataclass(slots=True)
+class SSAI:
+    bitrates: Bitrates = field(default_factory=Bitrates)
+    playback_url: str = ""
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any] | None) -> "SSAI":
+        data = data or {}
+        return cls(
+            bitrates=Bitrates.from_api(data.get("bitrates")),
+            playback_url=str(
+                data.get("ssaiPlaybackUrl", data.get("playbackUrl", "")) or ""
+            ),
+        )
+
+
+@dataclass(slots=True)
 class MPD:
     result: str = ""
     key: str = ""
@@ -143,6 +159,9 @@ class LiveURLOutput:
     is_drm: bool = False
     ext_id: str = ""
     algo_name: str = ""
+    algo_number: int = 0
+    playback_token: str = ""
+    ssai: SSAI = field(default_factory=SSAI)
     hdnea: str = ""
 
     @classmethod
@@ -161,6 +180,9 @@ class LiveURLOutput:
             is_drm=bool(data.get("isDRM", False)),
             ext_id=str(data.get("extId", "") or ""),
             algo_name=str(data.get("algoName", "") or ""),
+            algo_number=int(data.get("algoNumber", 0) or 0),
+            playback_token=str(data.get("playbackToken", "") or ""),
+            ssai=SSAI.from_api(data.get("ssai")),
         )
 
     def to_dict(self) -> dict[str, Any]:
