@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import constants, epg, secure_url, server, store
 from .config import cfg
+from .http_client import describe_proxy, validate_proxy_config
 from .scheduler import scheduler
 from .utils import get_path_prefix, init_logger, login_send_otp, login_verify_otp, logout
 
@@ -38,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Stream JioTV on any device",
     )
     parser.add_argument("-c", "--config", default="", help="Path to config file")
+    add_proxy_argument(parser)
     parser.add_argument(
         "--skip-update-check",
         action="store_true",
@@ -50,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("-H", "--host", default="localhost")
     serve_parser.add_argument("-p", "--port", default="5001")
     serve_parser.add_argument("-P", "--public", action="store_true")
+    add_proxy_argument(serve_parser, default=argparse.SUPPRESS)
     serve_parser.add_argument("--tls", action="store_true", help="Not implemented by this CLI")
     serve_parser.add_argument("--tls-cert", default="")
     serve_parser.add_argument("--tls-key", default="")
@@ -68,21 +71,26 @@ def build_parser() -> argparse.ArgumentParser:
     epg_parser = subcommands.add_parser("epg")
     epg_subcommands = epg_parser.add_subparsers(dest="epg_command")
     epg_generate = epg_subcommands.add_parser("generate", aliases=["gen", "g"])
+    add_proxy_argument(epg_generate, default=argparse.SUPPRESS)
     epg_generate.set_defaults(handler=generate_epg_command)
     epg_delete = epg_subcommands.add_parser("delete", aliases=["del", "d"])
+    add_proxy_argument(epg_delete, default=argparse.SUPPRESS)
     epg_delete.set_defaults(handler=delete_epg_command)
 
     login_parser = subcommands.add_parser("login")
     login_subcommands = login_parser.add_subparsers(dest="login_command")
     login_otp = login_subcommands.add_parser("otp")
+    add_proxy_argument(login_otp, default=argparse.SUPPRESS)
     login_otp.set_defaults(handler=login_otp_command)
     login_reset = login_subcommands.add_parser("reset", aliases=["logout", "lo"])
+    add_proxy_argument(login_reset, default=argparse.SUPPRESS)
     login_reset.set_defaults(handler=logout_command)
 
     background = subcommands.add_parser("background", aliases=["bg"])
     background_subcommands = background.add_subparsers(dest="background_command")
     bg_start = background_subcommands.add_parser("start", aliases=["run", "r"])
     bg_start.add_argument("-a", "--args", default="")
+    add_proxy_argument(bg_start, default=argparse.SUPPRESS)
     bg_start.set_defaults(handler=background_start_command)
     bg_stop = background_subcommands.add_parser("stop", aliases=["kill", "k"])
     bg_stop.set_defaults(handler=background_stop_command)
@@ -90,9 +98,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def bootstrap(config_path: str) -> None:
+def add_proxy_argument(
+    parser: argparse.ArgumentParser,
+    *,
+    default: str | object = "",
+) -> None:
+    parser.add_argument(
+        "--proxy",
+        default=default,
+        help=(
+            "Upstream proxy URL for JioTV requests. Supports http://, https://, "
+            "socks4://, socks4a://, socks5://, and socks5h://."
+        ),
+    )
+
+
+def bootstrap(config_path: str, proxy: str = "", *, validate_proxy: bool = True) -> None:
     cfg.load(config_path)
+    proxy_override = proxy or os.environ.get("JIOTV_PROXY", "")
+    if proxy_override:
+        cfg.proxy = proxy_override
     init_logger()
+    if validate_proxy:
+        try:
+            validate_proxy_config(cfg.proxy)
+        except (RuntimeError, ValueError) as exc:
+            raise SystemExit(str(exc)) from exc
+        if cfg.proxy:
+            print(f"Using upstream proxy: {describe_proxy(cfg.proxy)}")
     store.init()
     secure_url.init()
 
@@ -105,13 +138,14 @@ def serve_command(args: argparse.Namespace) -> int:
         args.config,
         log_stdout=getattr(args, "log_stdout", False),
         debug_log=getattr(args, "debug_log", False),
+        proxy=getattr(args, "proxy", ""),
     )
     server.serve(host, int(args.port))
     return 0
 
 
 def generate_epg_command(args: argparse.Namespace) -> int:
-    bootstrap(args.config)
+    bootstrap(args.config, getattr(args, "proxy", ""))
     epg_path = Path("epg.xml.gz")
     if epg_path.exists():
         epg_path.unlink()
@@ -121,7 +155,7 @@ def generate_epg_command(args: argparse.Namespace) -> int:
 
 
 def delete_epg_command(args: argparse.Namespace) -> int:
-    bootstrap(args.config)
+    bootstrap(args.config, getattr(args, "proxy", ""), validate_proxy=False)
     path = Path("epg.xml.gz")
     if path.exists():
         path.unlink()
@@ -132,7 +166,7 @@ def delete_epg_command(args: argparse.Namespace) -> int:
 
 
 def login_otp_command(args: argparse.Namespace) -> int:
-    bootstrap(args.config)
+    bootstrap(args.config, getattr(args, "proxy", ""))
     mobile_number = input("Enter your mobile number: +91 ").strip()
     number = "+91" + mobile_number
     print("Sending OTP to your mobile number")
@@ -144,15 +178,17 @@ def login_otp_command(args: argparse.Namespace) -> int:
 
 
 def logout_command(args: argparse.Namespace) -> int:
-    bootstrap(args.config)
+    bootstrap(args.config, getattr(args, "proxy", ""))
     logout()
     print("We have successfully logged you out. Please login again.")
     return 0
 
 
 def background_start_command(args: argparse.Namespace) -> int:
-    bootstrap(args.config)
-    command = [sys.executable, "-m", "jio_py", "--config", args.config, "serve"]
+    bootstrap(args.config, getattr(args, "proxy", ""))
+    command = [sys.executable, "-m", "jiotv_py", "--config", args.config, "serve"]
+    if getattr(args, "proxy", ""):
+        command.extend(["--proxy", args.proxy])
     command.extend(args.args.split())
     process = subprocess.Popen(command, start_new_session=True)
     pid_path().write_text(str(process.pid), encoding="utf-8")
@@ -161,7 +197,7 @@ def background_start_command(args: argparse.Namespace) -> int:
 
 
 def background_stop_command(args: argparse.Namespace) -> int:
-    bootstrap(args.config)
+    bootstrap(args.config, getattr(args, "proxy", ""), validate_proxy=False)
     pid_file = pid_path()
     pid = int(pid_file.read_text(encoding="utf-8").strip())
     os.kill(pid, signal.SIGTERM)

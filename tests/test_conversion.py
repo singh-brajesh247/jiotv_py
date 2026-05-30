@@ -11,8 +11,10 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 from jiotv_py import constants, secure_url, television, templates
+from jiotv_py.cli import build_parser
 from jiotv_py.config import JioTVConfig, cfg, parse_simple_yaml
 from jiotv_py.diagnostics import body_preview, redact_url
+from jiotv_py.http_client import describe_proxy, parse_proxy_url
 from jiotv_py.models import Bitrates, LiveURLOutput, SSAI
 from jiotv_py.server import (
     CachedResponse,
@@ -106,6 +108,41 @@ channels:
 
     def test_drm_defaults_to_enabled(self) -> None:
         self.assertTrue(JioTVConfig().drm)
+
+    def test_proxy_url_defaults_to_http_scheme(self) -> None:
+        proxy = parse_proxy_url("127.0.0.1:8080")
+        self.assertIsNotNone(proxy)
+        assert proxy is not None
+        self.assertEqual(proxy.scheme, "http")
+        self.assertEqual(proxy.proxy_url, "http://127.0.0.1:8080")
+        self.assertFalse(proxy.is_socks)
+
+    def test_socks_proxy_url_supports_remote_dns_and_credentials(self) -> None:
+        proxy = parse_proxy_url("socks5h://user:p%40ss@proxy.example:1080")
+        self.assertIsNotNone(proxy)
+        assert proxy is not None
+        self.assertEqual(proxy.scheme, "socks5h")
+        self.assertEqual(proxy.host, "proxy.example")
+        self.assertEqual(proxy.port, 1080)
+        self.assertEqual(proxy.username, "user")
+        self.assertEqual(proxy.password, "p@ss")
+        self.assertTrue(proxy.is_socks)
+        self.assertTrue(proxy.remote_dns)
+        self.assertEqual(
+            describe_proxy("socks5h://user:p%40ss@proxy.example:1080"),
+            "socks5h://proxy.example:1080 credentials=yes remote_dns=yes",
+        )
+
+    def test_proxy_url_rejects_unsupported_scheme(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_proxy_url("ftp://proxy.example:21")
+
+    def test_proxy_cli_argument_is_accepted_before_or_after_serve(self) -> None:
+        parser = build_parser()
+        root_args = parser.parse_args(["--proxy", "http://127.0.0.1:8080", "serve"])
+        serve_args = parser.parse_args(["serve", "--proxy", "socks5://127.0.0.1:1080"])
+        self.assertEqual(root_args.proxy, "http://127.0.0.1:8080")
+        self.assertEqual(serve_args.proxy, "socks5://127.0.0.1:1080")
 
 
 class TelevisionURLTests(unittest.TestCase):
@@ -641,6 +678,16 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("bufferingGoal: 15", html)
         self.assertIn("rebufferingGoal: 2", html)
         self.assertIn("lowLatencyMode: true", html)
+
+    def test_index_can_render_channel_fetch_error(self) -> None:
+        html = templates.render_index(
+            "Test",
+            [],
+            True,
+            error="Could not fetch channels",
+        )
+        self.assertIn("No channels found", html)
+        self.assertIn("Could not fetch channels", html)
 
 
 class TokenTests(unittest.TestCase):

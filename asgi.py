@@ -15,6 +15,7 @@ server.initialize(
     os.environ.get("JIOTV_CONFIG", ""),
     log_stdout=_truthy_env("JIOTV_LOG_TO_STDOUT"),
     debug_log=_truthy_env("JIOTV_DEBUG"),
+    proxy=os.environ.get("JIOTV_PROXY", ""),
 )
 
 app = server.asgi_app

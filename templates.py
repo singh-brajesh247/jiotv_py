@@ -187,17 +187,19 @@ def render_index(
     channels: list[Channel],
     is_not_logged_in: bool,
     login_required: bool = False,
+    error: str = "",
 ) -> str:
     cards = "\n".join(
         render_channel_card(channel, is_not_logged_in=is_not_logged_in)
         for channel in channels
     )
     if not cards:
+        message = escape(error or "Try another category, language, or search term.")
         cards = """
     <div class="empty-state">
       <div class="empty-state-icon">""" + _icon("tv") + """</div>
       <h2>No channels found</h2>
-      <p>Try another category, language, or search term.</p>
+      <p>""" + message + """</p>
     </div>"""
     category_options = "".join(
         f'<option value="{key}">{escape(value)}</option>'

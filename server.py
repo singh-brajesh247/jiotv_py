@@ -24,7 +24,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 from . import constants, epg, secure_url, store, television, templates, tokens
 from .config import cfg
-from .http_client import StreamingHTTPResponse, request, stream_request
+from .http_client import (
+    StreamingHTTPResponse,
+    describe_proxy,
+    request,
+    stream_request,
+    validate_proxy_config,
+)
 from .models import LiveURLOutput
 from .scheduler import scheduler
 from .streaming import (
@@ -119,13 +125,21 @@ def initialize(
     *,
     log_stdout: bool = False,
     debug_log: bool = False,
+    proxy: str = "",
 ) -> None:
     cfg.load(config_path)
+    proxy_override = proxy or os.environ.get("JIOTV_PROXY", "")
+    if proxy_override:
+        cfg.proxy = proxy_override
     if log_stdout:
         cfg.log_to_stdout = True
     if debug_log:
         cfg.debug = True
     init_logger()
+    try:
+        validate_proxy_config(cfg.proxy)
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
     store.init()
     secure_url.init()
     get_device_id()
@@ -139,6 +153,8 @@ def initialize(
         not cfg.disable_ts_handler,
         not cfg.disable_url_encryption,
     )
+    if cfg.proxy:
+        log.info("upstream proxy configured %s", describe_proxy(cfg.proxy))
     log.info(
         "scale settings workers=%s queue_limit=%s channels_ttl=%ss manifest_ttl=%ss "
         "segment_ttl=%ss segment_cache=%sMB item_limit=%sMB",
@@ -650,7 +666,23 @@ class JioTVRequestHandler:
         )
 
     def _index(self, query: dict[str, list[str]]) -> None:
-        api_response = television.channels()
+        try:
+            api_response = television.channels()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("channel list unavailable: %s", exc)
+            self._send_html(
+                templates.render_index(
+                    state.title,
+                    [],
+                    not check_logged_in(),
+                    login_required=self._query(query, "login") == "required",
+                    error=(
+                        "Could not fetch the JioTV channel list from upstream. "
+                        "Try again later, check network access, or use a custom channels file."
+                    ),
+                )
+            )
+            return
         host_url = self._host_url()
         for channel in api_response.result:
             if not channel.logo_url.startswith(("http://", "https://")):

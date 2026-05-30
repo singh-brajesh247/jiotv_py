@@ -26,7 +26,9 @@ disable_url_encryption: false
 # Folder path for all JIO_tv related files.
 path_prefix: ""
 
-# Proxy URL. Proxy is useful to bypass geo-restrictions and ip-restrictions for JioTV API. Default: ""
+# Proxy URL for upstream JioTV requests.
+# Supports http://, https://, socks4://, socks4a://, socks5://, and socks5h://.
+# Use socks5h:// when DNS lookup should also go through the proxy. Default: ""
 proxy: ""
 
 # LogPath is the directory for log files. Default: ""

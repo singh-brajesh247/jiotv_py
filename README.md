@@ -16,6 +16,19 @@ upstream request diagnostics:
 python3 -m jiotv_py serve --host localhost --port 5001 --log-stdout --debug-log
 ```
 
+Run upstream JioTV requests through a proxy:
+
+```bash
+python3 -m jiotv_py serve --host localhost --port 5001 --proxy http://127.0.0.1:8080
+python3 -m jiotv_py serve --host localhost --port 5001 --proxy socks5h://user:pass@127.0.0.1:1080
+```
+
+Supported schemes are `http://`, `https://`, `socks4://`, `socks4a://`,
+`socks5://`, and `socks5h://`. Use `socks5h://` when DNS lookup should also go
+through the SOCKS proxy. The same value can be set as `proxy` in the config file
+or as `JIOTV_PROXY`; the CLI `--proxy` flag and `JIOTV_PROXY` override the config
+file value.
+
 Logs are written to `JIO_tv.log` under the configured `path_prefix`. If no
 `path_prefix` is configured, the default is `$HOME/.JIO_tv/JIO_tv.log`.
 
@@ -48,6 +61,23 @@ docker run -d \
   -v jiotv-data:/data \
   jiotv-py:prod
 ```
+
+Run the container with an upstream proxy:
+
+```bash
+docker run -d \
+  --name jiotv-py \
+  --restart unless-stopped \
+  -p 5001:5001 \
+  -v jiotv-data:/data \
+  -e JIOTV_PROXY="socks5h://user:pass@host.docker.internal:1080" \
+  jiotv-py:prod
+```
+
+For an HTTP proxy, use a value like
+`JIOTV_PROXY="http://host.docker.internal:8080"`. If the proxy runs on the
+Docker host, use `host.docker.internal`; inside the container, `127.0.0.1`
+points to the container itself.
 
 Open:
 
