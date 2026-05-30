@@ -298,6 +298,46 @@ class ChannelsCacheTests(unittest.TestCase):
         self.assertEqual(second.result[0].id, "143")
         self.assertEqual(second.result[0].url, "")
 
+    def test_channels_fetch_falls_back_to_alternate_endpoint(self) -> None:
+        calls = []
+
+        def fake_read_json_response(url: str, _headers: dict[str, str]) -> dict[str, object]:
+            calls.append(url)
+            if len(calls) == 1:
+                raise RuntimeError("request failed with status 450")
+            return {
+                "code": 200,
+                "message": "ok",
+                "result": [{"channel_id": "155", "channel_name": "Sports"}],
+            }
+
+        with patch("jiotv_py.television.read_json_response", side_effect=fake_read_json_response):
+            response = television.channels()
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("jiotvapi.cdn.jio.com", calls[0])
+        self.assertIn("jiotv.data.cdn.jio.com", calls[1])
+        self.assertEqual(response.result[0].id, "155")
+
+    def test_channels_refresh_failure_serves_stale_cache(self) -> None:
+        cfg.channels_cache_ttl = 1
+        state = {"fail": False}
+
+        def fake_read_json_response(_url: str, _headers: dict[str, str]) -> dict[str, object]:
+            if state["fail"]:
+                raise RuntimeError("upstream down")
+            return {
+                "code": 200,
+                "message": "ok",
+                "result": [{"channel_id": "143", "channel_name": "News"}],
+            }
+
+        with patch("jiotv_py.television.read_json_response", side_effect=fake_read_json_response):
+            self.assertEqual(television.channels().result[0].id, "143")
+            time.sleep(1.01)
+            state["fail"] = True
+            self.assertEqual(television.channels().result[0].id, "143")
+
 
 class DashProxyTests(unittest.TestCase):
     def test_rewrite_mpd_replaces_existing_base_url(self) -> None:

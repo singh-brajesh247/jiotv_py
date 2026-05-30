@@ -334,7 +334,14 @@ def channels() -> ChannelsResponse:
             return cached
 
         log.info("channels cache miss; fetching channel list")
-        response = _fetch_channels()
+        try:
+            response = _fetch_channels()
+        except Exception:
+            stale = _stale_channels_response_locked()
+            if stale is not None:
+                log.warning("channels refresh failed; serving stale channel cache")
+                return stale
+            raise
         if cfg.channels_cache_ttl > 0:
             _channels_cache = ChannelsCacheEntry(response=response, updated_at=time.time())
         return clone_channels_response(response)
@@ -359,9 +366,15 @@ def _cached_channels_response_locked() -> ChannelsResponse | None:
     if entry is None:
         return None
     if time.time() - entry.updated_at > cfg.channels_cache_ttl:
-        _channels_cache = None
         return None
     log.debug("channels cache hit ttl=%ss", cfg.channels_cache_ttl)
+    return clone_channels_response(entry.response)
+
+
+def _stale_channels_response_locked() -> ChannelsResponse | None:
+    entry = _channels_cache
+    if entry is None:
+        return None
     return clone_channels_response(entry.response)
 
 
@@ -375,11 +388,23 @@ def _fetch_channels() -> ChannelsResponse:
         "lbcookie": "1",
         "usertype": "JIO",
     }
-    data = read_json_response(constants.CHANNELS_API_URL, headers)
+    data = read_channels_json(headers)
     response = ChannelsResponse.from_api(data)
     if cfg.custom_channels_file:
         response.result.extend(get_custom_channels())
     return response
+
+
+def read_channels_json(headers: dict[str, str]) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for url in (constants.CHANNELS_API_URL, constants.CHANNEL_URL):
+        try:
+            return read_json_response(url, headers)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            log.warning("channel list request failed url=%s error=%s", redact_url(url), exc)
+    assert last_error is not None
+    raise last_error
 
 
 def clone_channels_response(response: ChannelsResponse) -> ChannelsResponse:
