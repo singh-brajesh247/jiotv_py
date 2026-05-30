@@ -222,7 +222,6 @@ class SocksHTTPSHandler(HTTPSHandler):
             self._connection,
             req,
             context=self._context,
-            check_hostname=self._check_hostname,
         )
 
     def _connection(self, host: str, **kwargs: Any) -> SocksHTTPSConnection:

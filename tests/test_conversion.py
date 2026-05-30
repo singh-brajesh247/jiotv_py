@@ -14,7 +14,12 @@ from jiotv_py import constants, secure_url, television, templates
 from jiotv_py.cli import build_parser
 from jiotv_py.config import JioTVConfig, cfg, parse_simple_yaml
 from jiotv_py.diagnostics import body_preview, redact_url
-from jiotv_py.http_client import describe_proxy, parse_proxy_url
+from jiotv_py.http_client import (
+    ProxyConfig,
+    SocksHTTPSHandler,
+    describe_proxy,
+    parse_proxy_url,
+)
 from jiotv_py.models import Bitrates, LiveURLOutput, SSAI
 from jiotv_py.server import (
     CachedResponse,
@@ -143,6 +148,13 @@ channels:
         serve_args = parser.parse_args(["serve", "--proxy", "socks5://127.0.0.1:1080"])
         self.assertEqual(root_args.proxy, "http://127.0.0.1:8080")
         self.assertEqual(serve_args.proxy, "socks5://127.0.0.1:1080")
+
+    def test_socks_https_handler_uses_version_safe_context_args(self) -> None:
+        handler = SocksHTTPSHandler(ProxyConfig("socks5", "127.0.0.1", 1080))
+        handler.do_open = lambda http_class, req, **kwargs: kwargs  # type: ignore[method-assign]
+        kwargs = handler.https_open(object())
+        self.assertIn("context", kwargs)
+        self.assertNotIn("check_hostname", kwargs)
 
 
 class TelevisionURLTests(unittest.TestCase):
