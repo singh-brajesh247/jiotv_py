@@ -12,5 +12,14 @@
     "log_to_stdout": false,
     "custom_channels_file": "",
     "default_categories": [],
-    "default_languages": []
+    "default_languages": [],
+    "asgi_worker_threads": 256,
+    "asgi_request_queue_limit": 5000,
+    "asgi_queue_timeout_seconds": 5,
+    "asgi_response_queue_size": 64,
+    "channels_cache_ttl": 300,
+    "manifest_cache_ttl": 3,
+    "segment_cache_ttl": 20,
+    "segment_cache_max_bytes": 536870912,
+    "segment_cache_item_max_bytes": 8388608
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import io
 import json
 import mimetypes
@@ -11,6 +12,7 @@ import queue
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.message import Message
@@ -18,6 +20,7 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, quote_plus, unquote, urlencode, urlparse, urlunparse
+from concurrent.futures import ThreadPoolExecutor
 
 from . import constants, epg, secure_url, store, television, templates, tokens
 from .config import cfg
@@ -69,6 +72,22 @@ class LiveResultCacheEntry:
 
 
 @dataclass(slots=True)
+class CachedResponse:
+    body: bytes
+    status: HTTPStatus
+    content_type: str
+    headers: dict[str, str]
+    expires_at: float
+    size: int
+
+
+@dataclass(slots=True)
+class CacheFillLockEntry:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    refs: int = 0
+
+
+@dataclass(slots=True)
 class AppState:
     tv: Television | None = None
     title: str = "JIO_tv"
@@ -80,9 +99,19 @@ class AppState:
     live_result_cache: dict[str, LiveResultCacheEntry] = field(default_factory=dict)
     live_result_cache_lock: threading.RLock = field(default_factory=threading.RLock)
     live_warmup_inflight: set[str] = field(default_factory=set)
+    manifest_cache: dict[str, CachedResponse] = field(default_factory=dict)
+    manifest_cache_lock: threading.RLock = field(default_factory=threading.RLock)
+    segment_cache: dict[str, CachedResponse] = field(default_factory=dict)
+    segment_cache_lock: threading.RLock = field(default_factory=threading.RLock)
+    segment_cache_bytes: int = 0
+    cache_fill_locks: dict[str, CacheFillLockEntry] = field(default_factory=dict)
+    cache_fill_locks_lock: threading.RLock = field(default_factory=threading.RLock)
 
 
 state = AppState()
+_request_executor: ThreadPoolExecutor | None = None
+_request_executor_workers = 0
+_request_executor_lock = threading.RLock()
 
 
 def initialize(
@@ -110,6 +139,17 @@ def initialize(
         not cfg.disable_ts_handler,
         not cfg.disable_url_encryption,
     )
+    log.info(
+        "scale settings workers=%s queue_limit=%s channels_ttl=%ss manifest_ttl=%ss "
+        "segment_ttl=%ss segment_cache=%sMB item_limit=%sMB",
+        cfg.asgi_worker_threads,
+        cfg.asgi_request_queue_limit,
+        cfg.channels_cache_ttl,
+        cfg.manifest_cache_ttl,
+        cfg.segment_cache_ttl,
+        cfg.segment_cache_max_bytes // (1024 * 1024),
+        cfg.segment_cache_item_max_bytes // (1024 * 1024),
+    )
     if cfg.epg or (get_path_prefix() / "epg.xml.gz").exists():
         threading.Thread(target=epg.init, daemon=True).start()
 
@@ -120,6 +160,9 @@ def init_handlers() -> None:
     state.logout_disabled = cfg.disable_logout
     state.enable_drm = cfg.drm
     state.tv = Television(get_credentials())
+    with state.live_result_cache_lock:
+        state.live_result_cache.clear()
+    _clear_stream_response_caches()
     television.init_custom_channels()
     log.info(
         "handler state title=%r logged_in=%s custom_channels=%s",
@@ -148,6 +191,7 @@ def serve(host: str = "localhost", port: int = 5001) -> None:
         )
     finally:
         scheduler.stop()
+        _shutdown_request_executor()
 
 
 ASGIScope = dict[str, Any]
@@ -160,7 +204,7 @@ RetryHeaderUpdates = dict[str, str | None] | None
 class ASGIResponseWriter:
     def __init__(
         self,
-        output_queue: queue.Queue[ResponseQueueItem],
+        output_queue: Any,
     ) -> None:
         self._output_queue = output_queue
 
@@ -173,20 +217,91 @@ class ASGIResponseWriter:
         return
 
 
+class ASGIOutputQueue:
+    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int) -> None:
+        self._loop = loop
+        self._queue: asyncio.Queue[ResponseQueueItem] = asyncio.Queue(maxsize=max(0, maxsize))
+        self._closed = threading.Event()
+        self._pending_lock = threading.RLock()
+        self._pending_puts: set[concurrent.futures.Future[None]] = set()
+
+    def put(self, item: ResponseQueueItem) -> None:
+        if self._closed.is_set():
+            raise BrokenPipeError("ASGI response queue is closed")
+        future = asyncio.run_coroutine_threadsafe(self._queue.put(item), self._loop)
+        with self._pending_lock:
+            self._pending_puts.add(future)
+        try:
+            future.result(timeout=30)
+        except concurrent.futures.CancelledError as exc:
+            raise BrokenPipeError("ASGI response queue was cancelled") from exc
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise BrokenPipeError("ASGI response queue timed out") from exc
+        finally:
+            with self._pending_lock:
+                self._pending_puts.discard(future)
+
+    async def get(self) -> ResponseQueueItem:
+        return await self._queue.get()
+
+    def close(self) -> None:
+        self._closed.set()
+        with self._pending_lock:
+            pending = list(self._pending_puts)
+        for future in pending:
+            future.cancel()
+
+
 class JioTVASGIApp:
+    def __init__(self) -> None:
+        self._semaphore: asyncio.Semaphore | None = None
+        self._semaphore_loop: asyncio.AbstractEventLoop | None = None
+        self._semaphore_limit = 0
+
     async def __call__(self, scope: ASGIScope, receive: ASGIReceive, send: ASGISend) -> None:
         if scope["type"] != "http":
             return
         body = await _read_asgi_body(receive)
-        output_queue: queue.Queue[ResponseQueueItem] = queue.Queue()
-        thread = threading.Thread(
-            target=_run_asgi_handler,
-            args=(scope, body, output_queue),
-            daemon=True,
+        semaphore = self._inflight_semaphore()
+        try:
+            await asyncio.wait_for(
+                semaphore.acquire(),
+                timeout=max(0.1, cfg.asgi_queue_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            await _send_asgi_busy(send)
+            return
+
+        loop = asyncio.get_running_loop()
+        output_queue = ASGIOutputQueue(loop, cfg.asgi_response_queue_size)
+        future = loop.run_in_executor(
+            _get_request_executor(),
+            _run_asgi_handler,
+            scope,
+            body,
+            output_queue,
         )
-        thread.start()
-        await _send_asgi_response(output_queue, send)
-        thread.join(timeout=1)
+        try:
+            await _send_asgi_response(output_queue, send)
+            if future.done():
+                await future
+        finally:
+            output_queue.close()
+            semaphore.release()
+
+    def _inflight_semaphore(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        limit = max(1, cfg.asgi_request_queue_limit)
+        if (
+            self._semaphore is None
+            or self._semaphore_loop is not loop
+            or self._semaphore_limit != limit
+        ):
+            self._semaphore = asyncio.Semaphore(limit)
+            self._semaphore_loop = loop
+            self._semaphore_limit = limit
+        return self._semaphore
 
 
 asgi_app = JioTVASGIApp()
@@ -202,7 +317,7 @@ class JioTVRequestHandler:
         headers: Message | None = None,
         body: bytes = b"",
         client_address: tuple[str, int] = ("0.0.0.0", 0),
-        output_queue: queue.Queue[ResponseQueueItem] | None = None,
+        output_queue: Any | None = None,
     ) -> None:
         self.command = method.upper()
         self.path = path
@@ -395,6 +510,43 @@ class JioTVRequestHandler:
         *,
         retry_statuses: set[int] | None = None,
         on_retry: Callable[[int, bytes], RetryHeaderUpdates] | None = None,
+        cache_key: str = "",
+    ) -> int:
+        if cache_key:
+            cached = _get_segment_cache(cache_key)
+            if cached is not None:
+                log.debug("segment cache hit key=%s bytes=%s", cache_key, cached.size)
+                self._send_cached_response(cached)
+                return int(cached.status)
+            with _cache_fill_lock("segment", cache_key):
+                cached = _get_segment_cache(cache_key)
+                if cached is not None:
+                    log.debug("segment cache hit after lock key=%s bytes=%s", cache_key, cached.size)
+                    self._send_cached_response(cached)
+                    return int(cached.status)
+                return self._proxy_uncached(
+                    url,
+                    headers,
+                    retry_statuses=retry_statuses,
+                    on_retry=on_retry,
+                    cache_key=cache_key,
+                )
+        return self._proxy_uncached(
+            url,
+            headers,
+            retry_statuses=retry_statuses,
+            on_retry=on_retry,
+            cache_key="",
+        )
+
+    def _proxy_uncached(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        retry_statuses: set[int] | None = None,
+        on_retry: Callable[[int, bytes], RetryHeaderUpdates] | None = None,
+        cache_key: str = "",
     ) -> int:
         attempt_headers = dict(headers or {})
         for attempt in range(2):
@@ -415,12 +567,19 @@ class JioTVRequestHandler:
                                 attempt_headers.pop(header_name, None)
                             else:
                                 attempt_headers[header_name] = header_value
+                    cache_key = ""
                     continue
-                self._send_proxy_response(resp, url)
+                self._send_proxy_response(resp, url, cache_key=cache_key)
                 return resp.status
         return 0
 
-    def _send_proxy_response(self, resp: StreamingHTTPResponse, url: str) -> None:
+    def _send_proxy_response(
+        self,
+        resp: StreamingHTTPResponse,
+        url: str,
+        *,
+        cache_key: str = "",
+    ) -> None:
         content_type = resp.headers.get("Content-Type", "application/octet-stream")
         if resp.status >= 400:
             body = resp.stream.read()
@@ -430,6 +589,28 @@ class JioTVRequestHandler:
                 _http_status(resp.status),
                 content_type,
                 _proxy_passthrough_headers(resp.headers, include_content_length=False),
+            )
+            return
+
+        if cache_key and _can_cache_proxy_response(resp):
+            body = resp.stream.read()
+            headers = _proxy_passthrough_headers(resp.headers, include_content_length=False)
+            cached = CachedResponse(
+                body=body,
+                status=_http_status(resp.status),
+                content_type=content_type,
+                headers=headers,
+                expires_at=time.time() + max(0, cfg.segment_cache_ttl),
+                size=len(body),
+            )
+            _set_segment_cache(cache_key, cached)
+            self._send_cached_response(cached)
+            log.info(
+                "proxy cached response status=%s bytes=%s content_type=%s url=%s",
+                resp.status,
+                len(body),
+                content_type,
+                redact_url(url),
             )
             return
 
@@ -456,6 +637,14 @@ class JioTVRequestHandler:
             copied,
             content_type,
             redact_url(url),
+        )
+
+    def _send_cached_response(self, cached: CachedResponse) -> None:
+        self._send_bytes(
+            cached.body,
+            cached.status,
+            cached.content_type,
+            dict(cached.headers),
         )
 
     def _index(self, query: dict[str, list[str]]) -> None:
@@ -617,6 +806,45 @@ class JioTVRequestHandler:
             token_preview(url_token),
         )
 
+        manifest_cache_key = _manifest_cache_key(
+            channel_id,
+            quality or "auto",
+            render_url,
+            cached_hdnea,
+        )
+        cached_manifest = _get_manifest_cache(manifest_cache_key)
+        if cached_manifest is not None:
+            log.debug("render m3u8 cache hit channel=%s quality=%s", channel_id, quality or "auto")
+            self._send_cached_response(cached_manifest)
+            return
+        with _cache_fill_lock("manifest", manifest_cache_key):
+            cached_manifest = _get_manifest_cache(manifest_cache_key)
+            if cached_manifest is not None:
+                log.debug(
+                    "render m3u8 cache hit after lock channel=%s quality=%s",
+                    channel_id,
+                    quality or "auto",
+                )
+                self._send_cached_response(cached_manifest)
+                return
+            self._render_m3u8_uncached(
+                decoded_url,
+                render_url,
+                cached_hdnea,
+                channel_id,
+                quality,
+                manifest_cache_key,
+            )
+
+    def _render_m3u8_uncached(
+        self,
+        decoded_url: str,
+        render_url: str,
+        cached_hdnea: str,
+        channel_id: str,
+        quality: str,
+        manifest_cache_key: str,
+    ) -> None:
         assert state.tv is not None
         is_sony_channel = channel_id in constants.SONY_LIST
         body, status, new_hdnea = state.tv.render(
@@ -696,18 +924,32 @@ class JioTVRequestHandler:
             channel_id,
             quality,
         )
+        response_headers = {"Cache-Control": "public, must-revalidate, max-age=3"}
+        response_body = rewritten.encode("utf-8")
         log.info(
             "render m3u8 done channel=%s status=%s upstream_bytes=%s output_bytes=%s",
             channel_id,
             status,
             len(body),
-            len(rewritten.encode("utf-8")),
+            len(response_body),
         )
-        self._send_text(
-            rewritten,
+        if status < 400:
+            _set_manifest_cache(
+                manifest_cache_key,
+                CachedResponse(
+                    body=response_body,
+                    status=HTTPStatus(status),
+                    content_type="application/vnd.apple.mpegurl",
+                    headers=response_headers,
+                    expires_at=time.time() + max(0, cfg.manifest_cache_ttl),
+                    size=len(response_body),
+                ),
+            )
+        self._send_bytes(
+            response_body,
             HTTPStatus(status),
             "application/vnd.apple.mpegurl",
-            {"Cache-Control": "public, must-revalidate, max-age=3"},
+            response_headers,
         )
 
     def _rewrite_manifest(
@@ -816,11 +1058,15 @@ class JioTVRequestHandler:
             log.warning("render segment transient status=%s channel=%s; retrying", status, channel_id)
             return None
 
+        cache_key = ""
+        if _segment_cache_allowed(headers):
+            cache_key = _segment_cache_key(decoded_url, cached_hdnea)
         self._proxy(
             decoded_url,
             headers,
             retry_statuses={401, 403, 502, 503, 504},
             on_retry=retry_segment,
+            cache_key=cache_key,
         )
 
     def _render_key(self, query: dict[str, list[str]]) -> None:
@@ -1540,6 +1786,7 @@ class JioTVRequestHandler:
         state.tv = Television(get_credentials())
         with state.live_result_cache_lock:
             state.live_result_cache.clear()
+        _clear_stream_response_caches()
 
     def _refresh_channel_token(self, channel_id: str, *, force: bool = False) -> LiveURLOutput:
         with state.token_refresh_lock:
@@ -1582,7 +1829,7 @@ async def _read_asgi_body(receive: ASGIReceive) -> bytes:
 def _run_asgi_handler(
     scope: ASGIScope,
     body: bytes,
-    output_queue: queue.Queue[ResponseQueueItem],
+    output_queue: Any,
 ) -> None:
     try:
         client_address = scope.get("client") or ("0.0.0.0", 0)
@@ -1596,9 +1843,15 @@ def _run_asgi_handler(
         )
     except BaseException as exc:  # noqa: BLE001
         log.exception("asgi handler failed")
-        output_queue.put(exc)
+        try:
+            output_queue.put(exc)
+        except BrokenPipeError:
+            pass
     finally:
-        output_queue.put(None)
+        try:
+            output_queue.put(None)
+        except BrokenPipeError:
+            pass
 
 
 def _asgi_request_target(scope: ASGIScope) -> str:
@@ -1634,13 +1887,13 @@ def _asgi_headers(scope: ASGIScope, body_length: int = 0) -> Message:
 
 
 async def _send_asgi_response(
-    output_queue: queue.Queue[ResponseQueueItem],
+    output_queue: Any,
     send: ASGISend,
 ) -> None:
     pending = b""
     response_started = False
     while True:
-        item = await asyncio.to_thread(output_queue.get)
+        item = await _output_queue_get(output_queue)
         if item is None:
             break
         if isinstance(item, BaseException):
@@ -1668,6 +1921,12 @@ async def _send_asgi_response(
         await _send_asgi_error(send)
         return
     await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+async def _output_queue_get(output_queue: Any) -> ResponseQueueItem:
+    if isinstance(output_queue, ASGIOutputQueue):
+        return await output_queue.get()
+    return await asyncio.to_thread(output_queue.get)
 
 
 def _parse_raw_http_response_head(head: bytes) -> tuple[int, list[tuple[bytes, bytes]]]:
@@ -1704,6 +1963,184 @@ async def _send_asgi_error(send: ASGISend) -> None:
         }
     )
     await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+async def _send_asgi_busy(send: ASGISend) -> None:
+    body = b"server busy"
+    await send(
+        {
+            "type": "http.response.start",
+            "status": HTTPStatus.SERVICE_UNAVAILABLE,
+            "headers": [
+                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"retry-after", b"2"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body, "more_body": False})
+
+
+def _get_request_executor() -> ThreadPoolExecutor:
+    global _request_executor, _request_executor_workers
+    workers = max(1, cfg.asgi_worker_threads)
+    with _request_executor_lock:
+        if _request_executor is None or _request_executor_workers != workers:
+            if _request_executor is not None:
+                _request_executor.shutdown(wait=False, cancel_futures=True)
+            _request_executor = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="jio-asgi",
+            )
+            _request_executor_workers = workers
+        return _request_executor
+
+
+def _shutdown_request_executor() -> None:
+    global _request_executor, _request_executor_workers
+    with _request_executor_lock:
+        if _request_executor is not None:
+            _request_executor.shutdown(wait=False, cancel_futures=True)
+            _request_executor = None
+            _request_executor_workers = 0
+
+
+@contextmanager
+def _cache_fill_lock(namespace: str, key: str) -> Any:
+    lock_key = f"{namespace}:{key}"
+    with state.cache_fill_locks_lock:
+        entry = state.cache_fill_locks.get(lock_key)
+        if entry is None:
+            entry = CacheFillLockEntry()
+            state.cache_fill_locks[lock_key] = entry
+        entry.refs += 1
+    try:
+        with entry.lock:
+            yield
+    finally:
+        with state.cache_fill_locks_lock:
+            entry.refs -= 1
+            if entry.refs <= 0 and state.cache_fill_locks.get(lock_key) is entry:
+                state.cache_fill_locks.pop(lock_key, None)
+
+
+def _manifest_cache_key(
+    channel_id: str,
+    quality: str,
+    render_url: str,
+    hdnea_token: str,
+) -> str:
+    return "|".join((channel_id, quality, strip_hdnea_from_url(render_url), hdnea_token))
+
+
+def _get_manifest_cache(key: str) -> CachedResponse | None:
+    if cfg.manifest_cache_ttl <= 0:
+        return None
+    now = time.time()
+    with state.manifest_cache_lock:
+        entry = state.manifest_cache.get(key)
+        if entry is None:
+            return None
+        if entry.expires_at <= now:
+            state.manifest_cache.pop(key, None)
+            return None
+        return entry
+
+
+def _set_manifest_cache(key: str, response: CachedResponse) -> None:
+    if cfg.manifest_cache_ttl <= 0 or response.expires_at <= time.time():
+        return
+    with state.manifest_cache_lock:
+        state.manifest_cache[key] = response
+
+
+def _clear_stream_response_caches() -> None:
+    with state.manifest_cache_lock:
+        state.manifest_cache.clear()
+    with state.segment_cache_lock:
+        state.segment_cache.clear()
+        state.segment_cache_bytes = 0
+
+
+def _segment_cache_allowed(headers: dict[str, str]) -> bool:
+    if cfg.segment_cache_ttl <= 0 or cfg.segment_cache_max_bytes <= 0:
+        return False
+    return "Range" not in headers and "If-Range" not in headers
+
+
+def _segment_cache_key(url: str, hdnea_token: str) -> str:
+    return "|".join((strip_hdnea_from_url(url), hdnea_token))
+
+
+def _get_segment_cache(key: str) -> CachedResponse | None:
+    if cfg.segment_cache_ttl <= 0 or cfg.segment_cache_max_bytes <= 0:
+        return None
+    now = time.time()
+    with state.segment_cache_lock:
+        entry = state.segment_cache.get(key)
+        if entry is None:
+            return None
+        if entry.expires_at <= now:
+            state.segment_cache_bytes -= entry.size
+            state.segment_cache.pop(key, None)
+            return None
+        return entry
+
+
+def _set_segment_cache(key: str, response: CachedResponse) -> None:
+    if (
+        cfg.segment_cache_ttl <= 0
+        or cfg.segment_cache_max_bytes <= 0
+        or response.status != HTTPStatus.OK
+        or response.size <= 0
+        or response.size > cfg.segment_cache_item_max_bytes
+        or response.size > cfg.segment_cache_max_bytes
+        or response.expires_at <= time.time()
+    ):
+        return
+    with state.segment_cache_lock:
+        _prune_segment_cache_locked(time.time())
+        old = state.segment_cache.pop(key, None)
+        if old is not None:
+            state.segment_cache_bytes -= old.size
+        while (
+            state.segment_cache
+            and state.segment_cache_bytes + response.size > cfg.segment_cache_max_bytes
+        ):
+            oldest_key = next(iter(state.segment_cache))
+            old_entry = state.segment_cache.pop(oldest_key)
+            state.segment_cache_bytes -= old_entry.size
+        state.segment_cache[key] = response
+        state.segment_cache_bytes += response.size
+
+
+def _prune_segment_cache_locked(now: float) -> None:
+    expired = [
+        key
+        for key, entry in state.segment_cache.items()
+        if entry.expires_at <= now
+    ]
+    for key in expired:
+        entry = state.segment_cache.pop(key, None)
+        if entry is not None:
+            state.segment_cache_bytes -= entry.size
+    if state.segment_cache_bytes < 0:
+        state.segment_cache_bytes = 0
+
+
+def _can_cache_proxy_response(resp: StreamingHTTPResponse) -> bool:
+    if cfg.segment_cache_ttl <= 0:
+        return False
+    if resp.status != HTTPStatus.OK:
+        return False
+    length = resp.headers.get("Content-Length")
+    if not length:
+        return False
+    try:
+        content_length = int(length)
+    except ValueError:
+        return False
+    return 0 < content_length <= cfg.segment_cache_item_max_bytes
 
 
 def _http_status(status: int) -> HTTPStatus:

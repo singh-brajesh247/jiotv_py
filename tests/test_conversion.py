@@ -5,23 +5,29 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from email.message import Message
+from http import HTTPStatus
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
-from jio_py import constants, secure_url, templates
-from jio_py.config import JioTVConfig, parse_simple_yaml
+from jio_py import constants, secure_url, television, templates
+from jio_py.config import JioTVConfig, cfg, parse_simple_yaml
 from jio_py.diagnostics import body_preview, redact_url
 from jio_py.models import Bitrates, LiveURLOutput, SSAI
 from jio_py.server import (
+    CachedResponse,
     JioTVRequestHandler,
     _asgi_headers,
     _asgi_request_target,
     _cookie_header_from_set_cookie,
     _dash_passthrough_query,
     _filter_broken_sony_variants,
+    _get_segment_cache,
     _manifest_reference_base_url,
     _parse_raw_http_response_head,
     _rewrite_mpd_base_url,
+    _segment_cache_key,
+    _set_segment_cache,
     state,
 )
 from jio_py.streaming import (
@@ -82,6 +88,21 @@ channels:
         self.assertTrue(config.debug)
         self.assertEqual(config.default_languages, [1, 6])
         self.assertEqual(config.title, "Converted")
+
+    def test_config_apply_scale_knobs_as_ints(self) -> None:
+        config = JioTVConfig()
+        config.apply(
+            {
+                "asgi_worker_threads": "512",
+                "asgi_request_queue_limit": "5000",
+                "channels_cache_ttl": "120",
+                "segment_cache_max_bytes": "1048576",
+            }
+        )
+        self.assertEqual(config.asgi_worker_threads, 512)
+        self.assertEqual(config.asgi_request_queue_limit, 5000)
+        self.assertEqual(config.channels_cache_ttl, 120)
+        self.assertEqual(config.segment_cache_max_bytes, 1048576)
 
     def test_drm_defaults_to_enabled(self) -> None:
         self.assertTrue(JioTVConfig().drm)
@@ -237,6 +258,47 @@ class APICompatibilityTests(unittest.TestCase):
         )
 
 
+class ChannelsCacheTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.previous_ttl = cfg.channels_cache_ttl
+        self.previous_custom_channels_file = cfg.custom_channels_file
+        cfg.channels_cache_ttl = 300
+        cfg.custom_channels_file = ""
+        television.clear_channels_cache()
+
+    def tearDown(self) -> None:
+        cfg.channels_cache_ttl = self.previous_ttl
+        cfg.custom_channels_file = self.previous_custom_channels_file
+        television.clear_channels_cache()
+
+    def test_channels_cache_reuses_fetch_and_returns_mutable_clone(self) -> None:
+        calls = 0
+
+        def fake_read_json_response(_url: str, _headers: dict[str, str]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return {
+                "code": 200,
+                "message": "ok",
+                "result": [
+                    {
+                        "channel_id": "143",
+                        "channel_name": "News",
+                        "logoUrl": "logo.png",
+                    }
+                ],
+            }
+
+        with patch("jio_py.television.read_json_response", side_effect=fake_read_json_response):
+            first = television.channels()
+            first.result[0].url = "mutated-by-handler"
+            second = television.channels()
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(second.result[0].id, "143")
+        self.assertEqual(second.result[0].url, "")
+
+
 class DashProxyTests(unittest.TestCase):
     def test_rewrite_mpd_replaces_existing_base_url(self) -> None:
         body = b"<MPD><Period><BaseURL>https://cdn.example.com/dash/</BaseURL></Period></MPD>"
@@ -350,6 +412,68 @@ class LiveWarmupTests(unittest.TestCase):
         live_result = LiveURLOutput(bitrates=Bitrates(auto="https://example.com/live.m3u8"))
         handler._cache_live_result("155", live_result)
         self.assertIs(handler._cached_live_result("155"), live_result)
+
+
+class SegmentCacheTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.previous_ttl = cfg.segment_cache_ttl
+        self.previous_max = cfg.segment_cache_max_bytes
+        self.previous_item_max = cfg.segment_cache_item_max_bytes
+        cfg.segment_cache_ttl = 20
+        cfg.segment_cache_max_bytes = 8
+        cfg.segment_cache_item_max_bytes = 8
+        state.segment_cache.clear()
+        state.segment_cache_bytes = 0
+
+    def tearDown(self) -> None:
+        cfg.segment_cache_ttl = self.previous_ttl
+        cfg.segment_cache_max_bytes = self.previous_max
+        cfg.segment_cache_item_max_bytes = self.previous_item_max
+        state.segment_cache.clear()
+        state.segment_cache_bytes = 0
+
+    def test_segment_cache_strips_hdnea_from_key_and_evicts_oldest(self) -> None:
+        first_key = _segment_cache_key("https://cdn.example.com/a.ts?hdnea=old&x=1", "fresh")
+        same_key = _segment_cache_key("https://cdn.example.com/a.ts?hdnea=new&x=1", "fresh")
+        self.assertEqual(first_key, same_key)
+
+        _set_segment_cache(
+            first_key,
+            CachedResponse(
+                body=b"1234",
+                status=HTTPStatus.OK,
+                content_type="video/mp2t",
+                headers={},
+                expires_at=time.time() + 20,
+                size=4,
+            ),
+        )
+        _set_segment_cache(
+            "second",
+            CachedResponse(
+                body=b"5678",
+                status=HTTPStatus.OK,
+                content_type="video/mp2t",
+                headers={},
+                expires_at=time.time() + 20,
+                size=4,
+            ),
+        )
+        _set_segment_cache(
+            "third",
+            CachedResponse(
+                body=b"90",
+                status=HTTPStatus.OK,
+                content_type="video/mp2t",
+                headers={},
+                expires_at=time.time() + 20,
+                size=2,
+            ),
+        )
+
+        self.assertIsNone(_get_segment_cache(first_key))
+        self.assertIsNotNone(_get_segment_cache("second"))
+        self.assertIsNotNone(_get_segment_cache("third"))
 
 
 class PlaybackRoutingTests(unittest.TestCase):

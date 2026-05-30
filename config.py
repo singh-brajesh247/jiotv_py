@@ -39,6 +39,15 @@ class JioTVConfig:
     custom_channels_file: str = ""
     default_categories: list[int] = field(default_factory=list)
     default_languages: list[int] = field(default_factory=list)
+    asgi_worker_threads: int = 256
+    asgi_request_queue_limit: int = 5000
+    asgi_queue_timeout_seconds: int = 5
+    asgi_response_queue_size: int = 64
+    channels_cache_ttl: int = 300
+    manifest_cache_ttl: int = 3
+    segment_cache_ttl: int = 20
+    segment_cache_max_bytes: int = 536870912
+    segment_cache_item_max_bytes: int = 8388608
 
     def load(self, filename: str = "") -> None:
         path = Path(filename) if filename else common_file_exists()
@@ -53,6 +62,8 @@ class JioTVConfig:
             value = data[key]
             if isinstance(current, bool):
                 setattr(self, key, parse_bool(value))
+            elif isinstance(current, int):
+                setattr(self, key, parse_int(value, current))
             elif isinstance(current, list):
                 setattr(self, key, parse_int_list(value))
             else:
@@ -105,6 +116,15 @@ def load_env_data() -> dict[str, Any]:
         "custom_channels_file": "JIOTV_CUSTOM_CHANNELS_FILE",
         "default_categories": "JIOTV_DEFAULT_CATEGORIES",
         "default_languages": "JIOTV_DEFAULT_LANGUAGES",
+        "asgi_worker_threads": "JIOTV_ASGI_WORKER_THREADS",
+        "asgi_request_queue_limit": "JIOTV_ASGI_REQUEST_QUEUE_LIMIT",
+        "asgi_queue_timeout_seconds": "JIOTV_ASGI_QUEUE_TIMEOUT_SECONDS",
+        "asgi_response_queue_size": "JIOTV_ASGI_RESPONSE_QUEUE_SIZE",
+        "channels_cache_ttl": "JIOTV_CHANNELS_CACHE_TTL",
+        "manifest_cache_ttl": "JIOTV_MANIFEST_CACHE_TTL",
+        "segment_cache_ttl": "JIOTV_SEGMENT_CACHE_TTL",
+        "segment_cache_max_bytes": "JIOTV_SEGMENT_CACHE_MAX_BYTES",
+        "segment_cache_item_max_bytes": "JIOTV_SEGMENT_CACHE_ITEM_MAX_BYTES",
     }
     return {
         key: os.environ[env_key]
@@ -182,6 +202,13 @@ def parse_scalar(value: Any) -> Any:
         return int(text)
     except ValueError:
         return text
+
+
+def parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
 
 
 def parse_bool(value: Any) -> bool:

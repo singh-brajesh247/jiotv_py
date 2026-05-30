@@ -30,6 +30,23 @@ python3 -m jio_py background start --args "--host localhost --port 5001"
 python3 -m jio_py background stop
 ```
 
+Scale-oriented defaults are built into the Python server:
+
+- `asgi_worker_threads: 256` keeps blocking upstream work in a bounded pool
+  instead of creating one OS thread per request.
+- `asgi_request_queue_limit: 5000` accepts large bursts and returns HTTP 503
+  when the process is saturated instead of exhausting memory.
+- `channels_cache_ttl: 300`, `manifest_cache_ttl: 3`, and
+  `segment_cache_ttl: 20` share repeated channel, playlist, manifest, and media
+  segment work across viewers.
+- `segment_cache_max_bytes: 536870912` and
+  `segment_cache_item_max_bytes: 8388608` cap the in-process media cache.
+
+For thousands of concurrent clients, run behind a reverse proxy and expose the
+server with `--host 0.0.0.0`. For very large public traffic, put a CDN or caching
+proxy in front of the stream endpoints; one Python process cannot serve millions
+of concurrent video clients by itself.
+
 When a stream fails, check the log lines around:
 
 - `live route selected`: channel and selected upstream HLS URL.

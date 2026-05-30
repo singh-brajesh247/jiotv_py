@@ -42,3 +42,30 @@ default_categories = []
 # Default languages to display on the web page without filters. Array of language IDs. Default: []
 # Example: default_languages = [1, 6] # Hindi, English
 default_languages = []
+
+# Maximum blocking request handlers used behind the ASGI server. Default: 256
+asgi_worker_threads = 256
+
+# Maximum requests allowed to be active or queued before returning HTTP 503. Default: 5000
+asgi_request_queue_limit = 5000
+
+# How long a request may wait for handler capacity before HTTP 503. Default: 5
+asgi_queue_timeout_seconds = 5
+
+# Per-request response bridge chunks buffered between worker thread and ASGI loop. Default: 64
+asgi_response_queue_size = 64
+
+# Shared channel list cache TTL in seconds. Default: 300
+channels_cache_ttl = 300
+
+# Shared rewritten HLS manifest cache TTL in seconds. Default: 3
+manifest_cache_ttl = 3
+
+# Shared media segment cache TTL in seconds. Default: 20
+segment_cache_ttl = 20
+
+# Maximum total media segment cache size in bytes. Default: 512 MiB
+segment_cache_max_bytes = 536870912
+
+# Maximum single media segment cached in bytes. Default: 8 MiB
+segment_cache_item_max_bytes = 8388608

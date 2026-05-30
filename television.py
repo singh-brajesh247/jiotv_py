@@ -31,6 +31,14 @@ from .utils import (
 
 _custom_channels_cache: dict[str, Channel] = {}
 _custom_channels_lock = threading.RLock()
+_channels_cache_lock = threading.RLock()
+_channels_cache: ChannelsCacheEntry | None = None
+
+
+@dataclass(slots=True)
+class ChannelsCacheEntry:
+    response: ChannelsResponse
+    updated_at: float
 
 
 @dataclass(slots=True)
@@ -237,6 +245,7 @@ def load_and_cache_custom_channels() -> None:
     with _custom_channels_lock:
         _custom_channels_cache.clear()
         _custom_channels_cache.update(next_cache)
+    clear_channels_cache()
     if len(channels) > constants.MAX_RECOMMENDED_CHANNELS:
         log.warning("Loaded %s custom channels; channel lists may be slow", len(channels))
 
@@ -314,6 +323,49 @@ def is_default_custom_channels_path(path: Path) -> bool:
 
 
 def channels() -> ChannelsResponse:
+    cached = _cached_channels_response()
+    if cached is not None:
+        return cached
+
+    global _channels_cache
+    with _channels_cache_lock:
+        cached = _cached_channels_response_locked()
+        if cached is not None:
+            return cached
+
+        log.info("channels cache miss; fetching channel list")
+        response = _fetch_channels()
+        if cfg.channels_cache_ttl > 0:
+            _channels_cache = ChannelsCacheEntry(response=response, updated_at=time.time())
+        return clone_channels_response(response)
+
+
+def clear_channels_cache() -> None:
+    global _channels_cache
+    with _channels_cache_lock:
+        _channels_cache = None
+
+
+def _cached_channels_response() -> ChannelsResponse | None:
+    with _channels_cache_lock:
+        return _cached_channels_response_locked()
+
+
+def _cached_channels_response_locked() -> ChannelsResponse | None:
+    if cfg.channels_cache_ttl <= 0:
+        return None
+    global _channels_cache
+    entry = _channels_cache
+    if entry is None:
+        return None
+    if time.time() - entry.updated_at > cfg.channels_cache_ttl:
+        _channels_cache = None
+        return None
+    log.debug("channels cache hit ttl=%ss", cfg.channels_cache_ttl)
+    return clone_channels_response(entry.response)
+
+
+def _fetch_channels() -> ChannelsResponse:
     headers = {
         constants.USER_AGENT: constants.USER_AGENT_OKHTTP,
         constants.ACCEPT: constants.ACCEPT_JSON,
@@ -328,6 +380,27 @@ def channels() -> ChannelsResponse:
     if cfg.custom_channels_file:
         response.result.extend(get_custom_channels())
     return response
+
+
+def clone_channels_response(response: ChannelsResponse) -> ChannelsResponse:
+    return ChannelsResponse(
+        code=response.code,
+        message=response.message,
+        result=[clone_channel(channel) for channel in response.result],
+    )
+
+
+def clone_channel(channel: Channel) -> Channel:
+    return Channel(
+        id=channel.id,
+        name=channel.name,
+        url=channel.url,
+        logo_url=channel.logo_url,
+        category=channel.category,
+        language=channel.language,
+        is_hd=channel.is_hd,
+        is_catchup_available=channel.is_catchup_available,
+    )
 
 
 def filter_channels(
