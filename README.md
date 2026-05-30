@@ -92,13 +92,13 @@ container recreates.
 To reuse an existing host folder, bind-mount it to `/data`:
 
 ```bash
-mkdir -p /Users/kbrajesh/.jiotv_go
+mkdir -p /var/jiotv/data
 
 docker run -d \
   --name jiotv-py \
   --restart unless-stopped \
   -p 5001:5001 \
-  -v /Users/kbrajesh/.jiotv_go:/data \
+  -v /var/jiotv/data:/data \
   jiotv-py:prod
 ```
 
