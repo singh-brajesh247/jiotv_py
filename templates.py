@@ -463,13 +463,14 @@ def render_hls_player(
     asel: {{}},
     hlsjs: {{
       capLevelToPlayerSize: false,
-      lowLatencyMode: false,
-      maxBufferLength: 30,
-      maxMaxBufferLength: 60,
-      backBufferLength: 30,
-      liveSyncDurationCount: 4,
-      liveMaxLatencyDurationCount: 10,
-      maxBufferHole: 0.8,
+      lowLatencyMode: true,
+      maxBufferLength: 15,
+      maxMaxBufferLength: 20,
+      backBufferLength: 10,
+      liveBackBufferLength: 10,
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 4,
+      maxBufferHole: 0.5,
       maxFragLookUpTolerance: 0.5,
       manifestLoadingMaxRetry: 4,
       levelLoadingMaxRetry: 4,
@@ -495,7 +496,7 @@ def render_hls_player(
           if (video.seekable && video.seekable.length > 0) {{
             const start = video.seekable.start(0);
             const end = video.seekable.end(video.seekable.length - 1);
-            target = Math.min(start + smoothStartSeconds, Math.max(start, end - 2));
+            target = Math.max(start, end - smoothStartSeconds);
           }}
           if (Number.isFinite(target) && video.currentTime < target) {{
             video.currentTime = target;
@@ -558,9 +559,9 @@ document.addEventListener("shaka-ui-loaded", async () => {{
   const licenseUrl = {_js(license_url)};
   player.configure({{
     streaming: {{
-      bufferingGoal: 30,
-      rebufferingGoal: 6,
-      lowLatencyMode: false,
+      bufferingGoal: 15,
+      rebufferingGoal: 2,
+      lowLatencyMode: true,
       stallEnabled: true,
       stallThreshold: 1,
       stallSkip: 0.1,

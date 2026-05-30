@@ -370,6 +370,8 @@ class JioTVRequestHandler:
                 self._serve_static(path.removeprefix("/static/"))
             elif path.startswith("/out/"):
                 self._sony_liv_proxy(path, parsed.query)
+            elif method == "GET" and path == "/healthz":
+                self._send_json({"status": "ok"})
             elif method == "GET" and path == "/":
                 self._index(query)
             elif method == "POST" and path == "/login/sendOTP":

@@ -10,11 +10,11 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
-from jio_py import constants, secure_url, television, templates
-from jio_py.config import JioTVConfig, cfg, parse_simple_yaml
-from jio_py.diagnostics import body_preview, redact_url
-from jio_py.models import Bitrates, LiveURLOutput, SSAI
-from jio_py.server import (
+from jiotv_py import constants, secure_url, television, templates
+from jiotv_py.config import JioTVConfig, cfg, parse_simple_yaml
+from jiotv_py.diagnostics import body_preview, redact_url
+from jiotv_py.models import Bitrates, LiveURLOutput, SSAI
+from jiotv_py.server import (
     CachedResponse,
     JioTVRequestHandler,
     _asgi_headers,
@@ -30,7 +30,7 @@ from jio_py.server import (
     _set_segment_cache,
     state,
 )
-from jio_py.streaming import (
+from jiotv_py.streaming import (
     extract_hdnea_from_url,
     hdnea_remaining_lifetime,
     live_hls_url_candidates,
@@ -39,14 +39,14 @@ from jio_py.streaming import (
     strip_hdnea_from_url,
     to_absolute_stream_url,
 )
-from jio_py.television import (
+from jiotv_py.television import (
     EncryptedURLConfig,
     _extract_ssai_media_url,
     _with_ssai_session_params,
     create_encrypted_url,
     load_custom_channels,
 )
-from jio_py.tokens import should_refresh_token
+from jiotv_py.tokens import should_refresh_token
 
 
 class SecureURLTests(unittest.TestCase):
@@ -289,7 +289,7 @@ class ChannelsCacheTests(unittest.TestCase):
                 ],
             }
 
-        with patch("jio_py.television.read_json_response", side_effect=fake_read_json_response):
+        with patch("jiotv_py.television.read_json_response", side_effect=fake_read_json_response):
             first = television.channels()
             first.result[0].url = "mutated-by-handler"
             second = television.channels()
@@ -562,8 +562,10 @@ class ASGIBridgeTests(unittest.TestCase):
 class TemplateTests(unittest.TestCase):
     def test_hls_player_uses_stability_buffer_settings(self) -> None:
         html = templates.render_hls_player("/live/155.m3u8")
-        self.assertIn("lowLatencyMode: false", html)
-        self.assertIn("maxBufferLength: 30", html)
+        self.assertIn("lowLatencyMode: true", html)
+        self.assertIn("maxBufferLength: 15", html)
+        self.assertIn("liveSyncDurationCount: 2", html)
+        self.assertIn("liveMaxLatencyDurationCount: 4", html)
         self.assertIn("fragLoadingMaxRetry: 6", html)
 
     def test_hls_player_preloads_live_manifest(self) -> None:
@@ -574,6 +576,7 @@ class TemplateTests(unittest.TestCase):
     def test_hls_player_applies_smooth_start_to_android_special_channels(self) -> None:
         html = templates.render_hls_player("/live/155.m3u8", channel_id="155")
         self.assertIn("const smoothStartSeconds = 14.5", html)
+        self.assertIn("target = Math.max(start, end - smoothStartSeconds)", html)
         normal = templates.render_hls_player("/live/143.m3u8", channel_id="143")
         self.assertIn("const smoothStartSeconds = 0", normal)
 
@@ -595,9 +598,9 @@ class TemplateTests(unittest.TestCase):
 
     def test_drm_player_uses_stability_buffer_settings(self) -> None:
         html = templates.render_drm_player("/render.mpd?auth=abc&channel_id=476&q=auto")
-        self.assertIn("bufferingGoal: 30", html)
-        self.assertIn("rebufferingGoal: 6", html)
-        self.assertIn("lowLatencyMode: false", html)
+        self.assertIn("bufferingGoal: 15", html)
+        self.assertIn("rebufferingGoal: 2", html)
+        self.assertIn("lowLatencyMode: true", html)
 
 
 class TokenTests(unittest.TestCase):
